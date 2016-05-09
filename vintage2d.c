@@ -67,7 +67,7 @@ ssize_t vintage_read(struct file *file, char __user *buffer,
     return 0;
 }
 
-ssize_t vintage_write(struct file *file, char __user *buffer,
+ssize_t vintage_write(struct file *file, const char __user *buffer,
                       size_t size, loff_t *offset)
 {
     return 0;
@@ -124,12 +124,14 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
         // TODO: Which error?
         return -ENODEV;
     }
+
     char_dev = init_char_dev();
     ret = cdev_add(pci_dev_info->char_dev, pci_dev_info->current_dev, 1);
     if (ret < 0) {
         printk(KERN_ERR "Can't add char device\n");
         return ret;
     }
+
     device = device_create(vintage_class, NULL, pci_dev_info->current_dev,
                            NULL, "v2d%d", pci_dev_info->device_number);
     if (IS_ERR_OR_NULL(device)) {
@@ -138,8 +140,16 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
         // TODO: Which error?
         return -ENODEV;
     }
+
+    ret = pci_enable_device(dev);
+    if (ret < 0) {
+        printk(KERN_ERR "Can't enable device\n");
+        cdev_del(char_dev);
+        device_destroy(vintage_class, pci_dev_info->current_dev);
+        return ret;
+    }
+
     // Device successfully added
-    pci_enable_device(dev);
     pci_dev_info->pci_dev = dev;
     pci_dev_info->char_dev = char_dev;
     return 0;
