@@ -1,4 +1,5 @@
 #include <linux/cdev.h>
+#include <linux/err.h>
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/module.h>
@@ -19,6 +20,7 @@ MODULE_LICENSE("GPL");
 typedef struct {
     int device_number;
     unsigned int minor;
+    dev_t current_dev;
     struct pci_dev *pci_dev;
     struct cdev *char_dev;
 } pci_dev_info_t;
@@ -92,10 +94,27 @@ pci_dev_info_t *get_first_free_device_info() {
     return NULL;
 }
 
+pci_dev_info_t *get_dev_info(struct pci_dev *dev) {
+    int i;
+    for (i = 0; i < MAX_NUM_OF_DEVICES; ++i) {
+        if (pci_dev_info[i].pci_dev == dev) {
+            return pci_dev_info + i;
+        }
+    }
+    return NULL;
+}
+
+static struct cdev *init_char_dev()
+{
+    struct cdev *char_dev = cdev_alloc();
+    char_dev->owner = THIS_MODULE;
+    char_dev->ops = &vintage_file_ops;
+}
+
 static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
 {
-    dev_t current_dev;
     struct cdev *char_dev;
+    struct device *device;
     int ret;
 
     pci_dev_info_t *pci_dev_info = get_first_free_device_info();
@@ -104,29 +123,51 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
         // TODO: Which error?
         return -ENODEV;
     }
-    current_dev = MKDEV(major, pci_dev_info->minor);
-    cdev_init(char_dev, &vintage_file_ops);
-    char_dev->owner = THIS_MODULE;
-    ret = cdev_add(pci_dev_info->char_dev, current_dev, 1);
+    char_dev = init_char_dev();
+    ret = cdev_add(pci_dev_info->char_dev, pci_dev_info->current_dev, 1);
     if (ret < 0) {
         printk(KERN_ERR "Can't add char device\n");
         return ret;
     }
-
-    if (device_create(vintage_class, NULL, current_dev, NULL, "v2d%d",
-                      pci_dev_info->device_number) == NULL) {
+    device = device_create(vintage_class, NULL, pci_dev_info->current_dev,
+                           NULL, "v2d%d", pci_dev_info->device_number);
+    if (IS_ERR_OR_NULL(device)) {
         printk(KERN_ERR "Can't create device\n");
+        cdev_del(char_dev);
         // TODO: Which error?
         return -ENODEV;
     }
     // Device successfully added
+    pci_enable_device(dev);
     pci_dev_info->pci_dev = dev;
     pci_dev_info->char_dev = char_dev;
     return 0;
 }
 
+void remove_device(pci_dev_info_t *pci_dev_info)
+{
+    if (pci_dev_info->pci_dev != NULL) {
+        pci_disable_device(pci_dev_info->pci_dev);
+        pci_dev_info->pci_dev = NULL;
+    }
+    device_destroy(vintage_class, pci_dev_info->current_dev);
+    if (pci_dev_info->char_dev != NULL) {
+        cdev_del(pci_dev_info->char_dev);
+        pci_dev_info->char_dev = NULL;
+    }
+}
+
 static void vintage_remove(struct pci_dev *dev)
 {
+    pci_dev_info_t *pci_dev_info;
+
+    pci_dev_info = get_dev_info(dev);
+    if (pci_dev_info == NULL) {
+        printk(KERN_WARNING "Device not found in device table\n");
+        pci_disable_device(dev);
+    } else {
+        remove_device(pci_dev_info);
+    }
 }
 
 void init_pci_dev_info(unsigned int first_minor)
@@ -135,11 +176,11 @@ void init_pci_dev_info(unsigned int first_minor)
     for (i = 0; i < MAX_NUM_OF_DEVICES; ++i) {
         pci_dev_info[i].device_number = i;
         pci_dev_info[i].minor = first_minor++;
+        pci_dev_info[i].current_dev = MKDEV(major, pci_dev_info[i].minor);
         pci_dev_info[i].pci_dev = NULL;
         pci_dev_info[i].char_dev = NULL;
     }
 }
-
 
 static int vintage_init_module(void)
 {
@@ -153,14 +194,18 @@ static int vintage_init_module(void)
         printk(KERN_ERR "Can't allocate major number\n");
         return ret;
     }
-    major = MAJOR(dev_number);
-    init_pci_dev_info(MINOR(dev_number));
+
     vintage_class = class_create(THIS_MODULE, DEVICE_CLASS_NAME);
-    if (vintage_class == NULL) {
+    if (IS_ERR_OR_NULL(vintage_class)) {
         printk(KERN_ERR "Can't create device class\n");
+        unregister_chrdev_region(dev_number, MAX_NUM_OF_DEVICES);
         // TODO: Which error?
         return -ENODEV;
     }
+
+    /* Init helper structures */
+    major = MAJOR(dev_number);
+    init_pci_dev_info(MINOR(dev_number));
 
     /* register pci driver */
     ret = pci_register_driver(&vintage_driver);
@@ -171,7 +216,6 @@ static int vintage_init_module(void)
         printk(KERN_ERR "Can't register Vintage driver\n");
         return ret;
     }
-
     return 0;
 }
 
@@ -180,17 +224,18 @@ static void vintage_exit_module(void)
     int i;
 
     /* unregister pci driver */
-    pci_unregister_driver(&pci_driver);
+    pci_unregister_driver(&vintage_driver);
 
-    /* unregister character device */
-    for(i=0; i< MAX_DEVICE; i++) {
-        if (pci_cdev[i].pci_dev != NULL) {
-            cdev_del(pci_cdev[i].cdev);
-        }
+    /* Destroy device class */
+    class_destroy(vintage_class);
+
+    /* Remove devices */
+    for(i = 0; i < MAX_NUM_OF_DEVICES; ++i) {
+        remove_device(pci_dev_info + i);
     }
 
     /* free major/minor number */
-    unregister_chrdev_region(devno, MAX_DEVICE);
+    unregister_chrdev_region(dev_number, MAX_NUM_OF_DEVICES);
 
     printk(KERN_DEBUG "Module pci exit\n");
 }
