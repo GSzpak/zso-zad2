@@ -104,12 +104,6 @@ pci_dev_info_t *get_dev_info(struct pci_dev *dev) {
     return NULL;
 }
 
-static struct cdev *init_char_dev(void)
-{
-
-    return char_dev;
-}
-
 static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
 {
     struct cdev *char_dev;
@@ -130,8 +124,7 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
     }
     char_dev->owner = THIS_MODULE;
     char_dev->ops = &vintage_file_ops;
-    char_dev = init_char_dev();
-    ret = cdev_add(pci_dev_info->char_dev, pci_dev_info->current_dev, 1);
+    ret = cdev_add(char_dev, pci_dev_info->current_dev, 1);
     if (ret < 0) {
         printk(KERN_ERR "Can't add char device\n");
         return ret;
