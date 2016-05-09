@@ -27,8 +27,8 @@ typedef struct {
 
 /******************** Function declarations ****************************/
 
-int vintage_probe(struct pci_dev *, const struct pci_device_id *);
-void vintage_remove(struct pci_dev *);
+static int vintage_probe(struct pci_dev *, const struct pci_device_id *);
+static void vintage_remove(struct pci_dev *);
 ssize_t vintage_read(struct file *, char __user *, size_t, loff_t *);
 ssize_t vintage_write(struct file *, const char __user *, size_t, loff_t *);
 int vintage_open(struct inode *, struct file *);
@@ -84,7 +84,7 @@ int vintage_release(struct inode *inode, struct file *file)
 }
 
 
-pci_dev_info_t *get_first_free_device_info() {
+pci_dev_info_t *get_first_free_device_info(void) {
     int i;
     for (i = 0; i < MAX_NUM_OF_DEVICES; ++i) {
         if (pci_dev_info[i].pci_dev == NULL) {
@@ -104,11 +104,12 @@ pci_dev_info_t *get_dev_info(struct pci_dev *dev) {
     return NULL;
 }
 
-static struct cdev *init_char_dev()
+static struct cdev *init_char_dev(void)
 {
     struct cdev *char_dev = cdev_alloc();
     char_dev->owner = THIS_MODULE;
     char_dev->ops = &vintage_file_ops;
+    return char_dev;
 }
 
 static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
@@ -240,5 +241,5 @@ static void vintage_exit_module(void)
     printk(KERN_DEBUG "Module pci exit\n");
 }
 
-module_init(pci_init_module);
-module_exit(pci_exit_module);
+module_init(vintage_init_module);
+module_exit(vintage_exit_module);
