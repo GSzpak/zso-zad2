@@ -106,9 +106,7 @@ pci_dev_info_t *get_dev_info(struct pci_dev *dev) {
 
 static struct cdev *init_char_dev(void)
 {
-    struct cdev *char_dev = cdev_alloc();
-    char_dev->owner = THIS_MODULE;
-    char_dev->ops = &vintage_file_ops;
+
     return char_dev;
 }
 
@@ -125,6 +123,13 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
         return -ENODEV;
     }
 
+    char_dev = cdev_alloc();
+    if (char_dev == NULL) {
+        printk(KERN_ERR "Can't allocate char device\n");
+        return -ENODEV;
+    }
+    char_dev->owner = THIS_MODULE;
+    char_dev->ops = &vintage_file_ops;
     char_dev = init_char_dev();
     ret = cdev_add(pci_dev_info->char_dev, pci_dev_info->current_dev, 1);
     if (ret < 0) {
