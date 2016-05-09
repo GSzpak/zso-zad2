@@ -108,9 +108,12 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
 {
     struct cdev *char_dev;
     struct device *device;
+    pci_dev_info_t *pci_dev_info;
     int ret;
 
-    pci_dev_info_t *pci_dev_info = get_first_free_device_info();
+    printk(KERN_DEBUG "Vintage probe\n");
+
+    pci_dev_info = get_first_free_device_info();
     if (pci_dev_info == NULL) {
         printk(KERN_ERR "Can't add new device\n");
         // TODO: Which error?
@@ -169,6 +172,7 @@ void remove_device(pci_dev_info_t *pci_dev_info)
 static void vintage_remove(struct pci_dev *dev)
 {
     pci_dev_info_t *pci_dev_info;
+    printk(KERN_DEBUG "vintage remove\n");
 
     pci_dev_info = get_dev_info(dev);
     if (pci_dev_info == NULL) {
@@ -195,7 +199,7 @@ static int vintage_init_module(void)
 {
     int ret;
 
-    printk(KERN_DEBUG "Module pci init\n");
+    printk(KERN_DEBUG "Module init\n");
 
     /* allocate major numbers */
     ret = alloc_chrdev_region(&dev_number, 0, MAX_NUM_OF_DEVICES, DEVICE_NAME);
@@ -231,6 +235,7 @@ static int vintage_init_module(void)
 static void vintage_exit_module(void)
 {
     int i;
+    printk(KERN_DEBUG "Module exit\n");
 
     /* unregister pci driver */
     pci_unregister_driver(&vintage_driver);
