@@ -3,6 +3,7 @@
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/module.h>
+#include <linux/io.h>
 #include <linux/pci.h>
 #include "vintage2d.h"
 
@@ -12,8 +13,9 @@ MODULE_LICENSE("GPL");
 /******************** Defines ****************************/
 
 #define MAX_NUM_OF_DEVICES 256
-#define DEVICE_NAME "Vintage2D"
+#define DRIVER_NAME "vintage2d-pci"
 #define DEVICE_CLASS_NAME "Vintage"
+#define MMIO_SIZE 4096
 
 /******************** Typedefs ****************************/
 
@@ -23,6 +25,7 @@ typedef struct {
     dev_t current_dev;
     struct pci_dev *pci_dev;
     struct cdev *char_dev;
+    void __iomem *iomem;
 } pci_dev_info_t;
 
 /******************** Function declarations ****************************/
@@ -41,7 +44,7 @@ static struct pci_device_id pci_ids[] = {
     { 0, }
 };
 static struct pci_driver vintage_driver = {
-    .name = DEVICE_NAME,
+    .name = DRIVER_NAME,
     .id_table = pci_ids,
     .probe = vintage_probe,
     .remove = vintage_remove,
@@ -104,11 +107,14 @@ pci_dev_info_t *get_dev_info(struct pci_dev *dev) {
     return NULL;
 }
 
+// TODO: goto everywhere
+
 static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
 {
     struct cdev *char_dev;
     struct device *device;
     pci_dev_info_t *pci_dev_info;
+    void __iomem *iomem;
     int ret;
 
     printk(KERN_DEBUG "Vintage probe\n");
@@ -145,20 +151,45 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
     ret = pci_enable_device(dev);
     if (ret < 0) {
         printk(KERN_ERR "Can't enable device\n");
-        cdev_del(char_dev);
         device_destroy(vintage_class, pci_dev_info->current_dev);
+        cdev_del(char_dev);
         return ret;
+    }
+
+    ret = pci_request_regions(dev, DRIVER_NAME);
+    if (ret < 0) {
+        printk(KERN_ERR "Can't request BAR0\n");
+        pci_disable_device(dev);
+        device_destroy(vintage_class, pci_dev_info->current_dev);
+        cdev_del(char_dev);
+        return ret;
+    }
+
+    iomem = pci_iomap(dev, 0, MMIO_SIZE);
+    if (IS_ERR_OR_NULL(iomem)) {
+        printk(KERN_ERR "Can't map BAR0\n");
+        pci_release_regions(dev);
+        pci_disable_device(dev);
+        device_destroy(vintage_class, pci_dev_info->current_dev);
+        cdev_del(char_dev);
+        return -ENODEV;
     }
 
     // Device successfully added
     pci_dev_info->pci_dev = dev;
     pci_dev_info->char_dev = char_dev;
+    pci_dev_info->iomem = iomem;
     return 0;
 }
 
 void remove_device(pci_dev_info_t *pci_dev_info)
 {
     if (pci_dev_info->pci_dev != NULL) {
+        if (pci_dev_info->iomem != NULL) {
+            pcim_iounmap(pci_dev_info->pci_dev, pci_dev_info->iomem);
+            pci_dev_info->iomem = NULL;
+        }
+        pci_release_regions(pci_dev_info->pci_dev);
         pci_disable_device(pci_dev_info->pci_dev);
         pci_dev_info->pci_dev = NULL;
     }
@@ -192,6 +223,7 @@ void init_pci_dev_info(unsigned int first_minor)
         pci_dev_info[i].current_dev = MKDEV(major, pci_dev_info[i].minor);
         pci_dev_info[i].pci_dev = NULL;
         pci_dev_info[i].char_dev = NULL;
+        pci_dev_info[i].iomem = NULL;
     }
 }
 
@@ -202,7 +234,7 @@ static int vintage_init_module(void)
     printk(KERN_DEBUG "Module init\n");
 
     /* allocate major numbers */
-    ret = alloc_chrdev_region(&dev_number, 0, MAX_NUM_OF_DEVICES, DEVICE_NAME);
+    ret = alloc_chrdev_region(&dev_number, 0, MAX_NUM_OF_DEVICES, DRIVER_NAME);
     if (ret < 0) {
         printk(KERN_ERR "Can't allocate major number\n");
         return ret;
@@ -251,7 +283,7 @@ static void vintage_exit_module(void)
     /* free major/minor number */
     unregister_chrdev_region(dev_number, MAX_NUM_OF_DEVICES);
 
-    printk(KERN_DEBUG "Module pci exit\n");
+    printk(KERN_DEBUG "Module exit end\n");
 }
 
 module_init(vintage_init_module);
