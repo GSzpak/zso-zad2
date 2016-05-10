@@ -156,6 +156,14 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
         return ret;
     }
 
+    if (!(pci_resource_flags(dev, 0) & IORESOURCE_MEM)) {
+        printk(KERN_ERR "BAR0 is not an IO region\n");
+        pci_disable_device(dev);
+        device_destroy(vintage_class, pci_dev_info->current_dev);
+        cdev_del(char_dev);
+        return ret;
+    }
+
     ret = pci_request_regions(dev, DRIVER_NAME);
     if (ret < 0) {
         printk(KERN_ERR "Can't request BAR0\n");
