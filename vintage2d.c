@@ -194,7 +194,7 @@ void remove_device(pci_dev_info_t *pci_dev_info)
 {
     if (pci_dev_info->pci_dev != NULL) {
         if (pci_dev_info->iomem != NULL) {
-            pcim_iounmap(pci_dev_info->pci_dev, pci_dev_info->iomem);
+            pci_iounmap(pci_dev_info->pci_dev, pci_dev_info->iomem);
             pci_dev_info->iomem = NULL;
         }
         pci_release_regions(pci_dev_info->pci_dev);
