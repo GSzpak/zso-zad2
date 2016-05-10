@@ -211,8 +211,8 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
 
 void remove_device(pci_dev_info_t *pci_dev_info)
 {
-    printk(KERN_DEBUG "Removing device\n");
     if (pci_dev_info->pci_dev != NULL) {
+        printk(KERN_DEBUG "Removing device\n");
         pci_disable_device(pci_dev_info->pci_dev);
         printk(KERN_DEBUG "After disabling device\n");
         free_irq(pci_dev_info->pci_dev->irq, (void *) pci_dev_info);
@@ -225,9 +225,9 @@ void remove_device(pci_dev_info_t *pci_dev_info)
         pci_release_regions(pci_dev_info->pci_dev);
         printk(KERN_DEBUG "After release_regions\n");
         pci_dev_info->pci_dev = NULL;
+        device_destroy(vintage_class, pci_dev_info->current_dev);
+        printk(KERN_DEBUG "After device_destroy\n");
     }
-    device_destroy(vintage_class, pci_dev_info->current_dev);
-    printk(KERN_DEBUG "After device_destroy\n");
     if (pci_dev_info->char_dev != NULL) {
         cdev_del(pci_dev_info->char_dev);
         printk(KERN_DEBUG "After cdev_del\n");
