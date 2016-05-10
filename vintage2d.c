@@ -124,12 +124,12 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
     void __iomem *iomem;
     int ret;
 
-    printk(KERN_DEBUG "Vintage probe\n");
+    printk(KERN_WARNING "Vintage probe\n");
 
     pci_dev_info = get_first_free_device_info();
     if (pci_dev_info == NULL) {
         printk(KERN_ERR "Failed to add new device\n");
-        // TODO: Which error?
+        // TODO: Which error? (Check everywhere)
         return -ENODEV;
     }
 
@@ -151,55 +151,45 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
                            NULL, "v2d%d", pci_dev_info->device_number);
     if (IS_ERR_OR_NULL(device)) {
         printk(KERN_ERR "Failed to create device\n");
-        cdev_del(char_dev);
         // TODO: Which error?
-        return -ENODEV;
+        ret = -ENODEV;
+        goto device_create_failed;
     }
 
     if (!(pci_resource_flags(dev, 0) & IORESOURCE_MEM)) {
         printk(KERN_ERR "BAR0 is not an IO region\n");
-        device_destroy(vintage_class, pci_dev_info->current_dev);
-        cdev_del(char_dev);
-        return ret;
+        goto pci_request_regions_failed;
     }
 
     ret = pci_request_regions(dev, DRIVER_NAME);
     if (ret < 0) {
         printk(KERN_ERR "Failed to request BAR0\n");
-        device_destroy(vintage_class, pci_dev_info->current_dev);
-        cdev_del(char_dev);
-        return ret;
+        goto pci_request_regions_failed;
     }
 
     iomem = pci_iomap(dev, 0, MMIO_SIZE);
     if (IS_ERR_OR_NULL(iomem)) {
         printk(KERN_ERR "Failed to map BAR0\n");
-        pci_release_regions(dev);
-        device_destroy(vintage_class, pci_dev_info->current_dev);
-        cdev_del(char_dev);
-        return -ENODEV;
+        if (iomem == NULL) {
+            ret = -ENOMEM;
+        } else {
+            // FIXME: cast is ugly?
+            ret = PTR_ERR(iomem);
+        }
+        goto pci_iomap_failed;
     }
 
     ret = request_irq(dev->irq, irq_handler, IRQF_SHARED, DRIVER_NAME,
                       (void *) pci_dev_info);
     if (ret < 0) {
         printk(KERN_ERR "Failed to request irq");
-        pci_iounmap(dev, iomem);
-        pci_release_regions(dev);
-        device_destroy(vintage_class, pci_dev_info->current_dev);
-        cdev_del(char_dev);
-        return ret;
+        goto request_irq_failed;
     }
 
     ret = pci_enable_device(dev);
     if (ret < 0) {
         printk(KERN_ERR "Failed to enable device\n");
-        free_irq(dev->irq, iomem);
-        pci_iounmap(dev, iomem);
-        pci_release_regions(dev);
-        device_destroy(vintage_class, pci_dev_info->current_dev);
-        cdev_del(char_dev);
-        return ret;
+        goto enable_device_failed;
     }
 
     // Device successfully added
@@ -207,6 +197,18 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
     pci_dev_info->char_dev = char_dev;
     pci_dev_info->iomem = iomem;
     return 0;
+
+enable_device_failed:
+    free_irq(dev->irq, iomem);
+request_irq_failed:
+    pci_iounmap(dev, iomem);
+pci_iomap_failed:
+    pci_release_regions(dev);
+pci_request_regions_failed:
+    device_destroy(vintage_class, pci_dev_info->current_dev);
+device_create_failed:
+    cdev_del(char_dev);
+    return ret;
 }
 
 void remove_device(pci_dev_info_t *pci_dev_info)
@@ -238,7 +240,7 @@ void remove_device(pci_dev_info_t *pci_dev_info)
 static void vintage_remove(struct pci_dev *dev)
 {
     pci_dev_info_t *pci_dev_info;
-    printk(KERN_DEBUG "vintage remove\n");
+    printk(KERN_WARNING "vintage remove\n");
 
     pci_dev_info = get_dev_info(dev);
     if (pci_dev_info == NULL) {
@@ -266,7 +268,7 @@ static int vintage_init_module(void)
 {
     int ret;
 
-    printk(KERN_DEBUG "Module init\n");
+    printk(KERN_WARNING "Module init\n");
 
     /* allocate major numbers */
     ret = alloc_chrdev_region(&dev_number, 0, MAX_NUM_OF_DEVICES, DRIVER_NAME);
@@ -278,9 +280,9 @@ static int vintage_init_module(void)
     vintage_class = class_create(THIS_MODULE, DEVICE_CLASS_NAME);
     if (IS_ERR_OR_NULL(vintage_class)) {
         printk(KERN_ERR "Failed to create device class\n");
-        unregister_chrdev_region(dev_number, MAX_NUM_OF_DEVICES);
         // TODO: Which error?
-        return -ENODEV;
+        ret = -ENODEV;
+        goto class_create_failed;
     }
 
     /* Init helper structures */
@@ -290,19 +292,24 @@ static int vintage_init_module(void)
     /* register pci driver */
     ret = pci_register_driver(&vintage_driver);
     if (ret < 0) {
-        // unregister_chrdev_region(dev_number, 1) ?
-        unregister_chrdev_region(dev_number, MAX_NUM_OF_DEVICES);
-        class_destroy(vintage_class);
-        printk(KERN_ERR "Failed to register Vintage driver\n");
-        return ret;
+        printk(KERN_ERR "Failed to register Vintage2D driver\n");
+        goto pci_register_driver_failed;
     }
+
     return 0;
+
+pci_register_driver_failed:
+    class_destroy(vintage_class);
+class_create_failed:
+    // TODO: unregister_chrdev_region(dev_number, 1) ?
+    unregister_chrdev_region(dev_number, MAX_NUM_OF_DEVICES);
+    return ret;
 }
 
 static void vintage_exit_module(void)
 {
     int i;
-    printk(KERN_DEBUG "Module exit\n");
+    printk(KERN_WARNING "Module exit\n");
 
     /* unregister pci driver */
     pci_unregister_driver(&vintage_driver);
