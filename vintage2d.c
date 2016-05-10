@@ -1,7 +1,9 @@
 #include <linux/cdev.h>
 #include <linux/err.h>
 #include <linux/fs.h>
+#include <linux/irqreturn.h>
 #include <linux/init.h>
+#include <linux/interrupt.h>
 #include <linux/module.h>
 #include <linux/io.h>
 #include <linux/pci.h>
@@ -107,6 +109,11 @@ pci_dev_info_t *get_dev_info(struct pci_dev *dev) {
     return NULL;
 }
 
+irqreturn_t irq_handler(int irq, void *dev)
+{
+    return IRQ_HANDLED;
+}
+
 // TODO: goto everywhere
 
 static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
@@ -121,44 +128,36 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
 
     pci_dev_info = get_first_free_device_info();
     if (pci_dev_info == NULL) {
-        printk(KERN_ERR "Can't add new device\n");
+        printk(KERN_ERR "Failed to add new device\n");
         // TODO: Which error?
         return -ENODEV;
     }
 
     char_dev = cdev_alloc();
-    if (char_dev == NULL) {
-        printk(KERN_ERR "Can't allocate char device\n");
+    if (IS_ERR_OR_NULL(char_dev)) {
+        printk(KERN_ERR "Failed to allocate char device\n");
         return -ENODEV;
     }
     char_dev->owner = THIS_MODULE;
     char_dev->ops = &vintage_file_ops;
     ret = cdev_add(char_dev, pci_dev_info->current_dev, 1);
     if (ret < 0) {
-        printk(KERN_ERR "Can't add char device\n");
+        // TODO: Free char_dev?
+        printk(KERN_ERR "Failed to add char device\n");
         return ret;
     }
 
     device = device_create(vintage_class, NULL, pci_dev_info->current_dev,
                            NULL, "v2d%d", pci_dev_info->device_number);
     if (IS_ERR_OR_NULL(device)) {
-        printk(KERN_ERR "Can't create device\n");
+        printk(KERN_ERR "Failed to create device\n");
         cdev_del(char_dev);
         // TODO: Which error?
         return -ENODEV;
     }
 
-    ret = pci_enable_device(dev);
-    if (ret < 0) {
-        printk(KERN_ERR "Can't enable device\n");
-        device_destroy(vintage_class, pci_dev_info->current_dev);
-        cdev_del(char_dev);
-        return ret;
-    }
-
     if (!(pci_resource_flags(dev, 0) & IORESOURCE_MEM)) {
         printk(KERN_ERR "BAR0 is not an IO region\n");
-        pci_disable_device(dev);
         device_destroy(vintage_class, pci_dev_info->current_dev);
         cdev_del(char_dev);
         return ret;
@@ -166,8 +165,7 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
 
     ret = pci_request_regions(dev, DRIVER_NAME);
     if (ret < 0) {
-        printk(KERN_ERR "Can't request BAR0\n");
-        pci_disable_device(dev);
+        printk(KERN_ERR "Failed to request BAR0\n");
         device_destroy(vintage_class, pci_dev_info->current_dev);
         cdev_del(char_dev);
         return ret;
@@ -175,12 +173,33 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
 
     iomem = pci_iomap(dev, 0, MMIO_SIZE);
     if (IS_ERR_OR_NULL(iomem)) {
-        printk(KERN_ERR "Can't map BAR0\n");
+        printk(KERN_ERR "Failed to map BAR0\n");
         pci_release_regions(dev);
-        pci_disable_device(dev);
         device_destroy(vintage_class, pci_dev_info->current_dev);
         cdev_del(char_dev);
         return -ENODEV;
+    }
+
+    ret = request_irq(dev->irq, irq_handler, IRQF_SHARED, DRIVER_NAME,
+                      (void *) pci_dev_info);
+    if (ret < 0) {
+        printk(KERN_ERR "Failed to request irq");
+        pci_iounmap(dev, iomem);
+        pci_release_regions(dev);
+        device_destroy(vintage_class, pci_dev_info->current_dev);
+        cdev_del(char_dev);
+        return ret;
+    }
+
+    ret = pci_enable_device(dev);
+    if (ret < 0) {
+        printk(KERN_ERR "Failed to enable device\n");
+        free_irq(dev->irq, iomem);
+        pci_iounmap(dev, iomem);
+        pci_release_regions(dev);
+        device_destroy(vintage_class, pci_dev_info->current_dev);
+        cdev_del(char_dev);
+        return ret;
     }
 
     // Device successfully added
@@ -192,18 +211,26 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
 
 void remove_device(pci_dev_info_t *pci_dev_info)
 {
+    printk(KERN_DEBUG "Removing device\n");
     if (pci_dev_info->pci_dev != NULL) {
+        pci_disable_device(pci_dev_info->pci_dev);
+        printk(KERN_DEBUG "After disabling device\n");
+        free_irq(pci_dev_info->pci_dev->irq, (void *) pci_dev_info);
+        printk(KERN_DEBUG "After free_irq\n");
         if (pci_dev_info->iomem != NULL) {
             pci_iounmap(pci_dev_info->pci_dev, pci_dev_info->iomem);
+            printk(KERN_DEBUG "After iounmap\n");
             pci_dev_info->iomem = NULL;
         }
         pci_release_regions(pci_dev_info->pci_dev);
-        pci_disable_device(pci_dev_info->pci_dev);
+        printk(KERN_DEBUG "After release_regions\n");
         pci_dev_info->pci_dev = NULL;
     }
     device_destroy(vintage_class, pci_dev_info->current_dev);
+    printk(KERN_DEBUG "After device_destroy\n");
     if (pci_dev_info->char_dev != NULL) {
         cdev_del(pci_dev_info->char_dev);
+        printk(KERN_DEBUG "After cdev_del\n");
         pci_dev_info->char_dev = NULL;
     }
 }
@@ -244,13 +271,13 @@ static int vintage_init_module(void)
     /* allocate major numbers */
     ret = alloc_chrdev_region(&dev_number, 0, MAX_NUM_OF_DEVICES, DRIVER_NAME);
     if (ret < 0) {
-        printk(KERN_ERR "Can't allocate major number\n");
+        printk(KERN_ERR "Failed to allocate major number\n");
         return ret;
     }
 
     vintage_class = class_create(THIS_MODULE, DEVICE_CLASS_NAME);
     if (IS_ERR_OR_NULL(vintage_class)) {
-        printk(KERN_ERR "Can't create device class\n");
+        printk(KERN_ERR "Failed to create device class\n");
         unregister_chrdev_region(dev_number, MAX_NUM_OF_DEVICES);
         // TODO: Which error?
         return -ENODEV;
@@ -266,7 +293,7 @@ static int vintage_init_module(void)
         // unregister_chrdev_region(dev_number, 1) ?
         unregister_chrdev_region(dev_number, MAX_NUM_OF_DEVICES);
         class_destroy(vintage_class);
-        printk(KERN_ERR "Can't register Vintage driver\n");
+        printk(KERN_ERR "Failed to register Vintage driver\n");
         return ret;
     }
     return 0;
