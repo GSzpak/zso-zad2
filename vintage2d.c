@@ -7,6 +7,7 @@
 #include <linux/module.h>
 #include <linux/io.h>
 #include <linux/pci.h>
+#include <linux/slab.h>
 #include "vintage2d.h"
 
 
@@ -18,6 +19,7 @@ MODULE_LICENSE("GPL");
 #define DRIVER_NAME "vintage2d-pci"
 #define DEVICE_CLASS_NAME "Vintage"
 #define MMIO_SIZE 4096
+#define COMMAND_BUF_SIZE 65536
 
 /******************** Typedefs ****************************/
 
@@ -30,14 +32,22 @@ typedef struct {
     void __iomem *iomem;
 } pci_dev_info_t;
 
+typedef struct {
+    pci_dev_info_t *pci_dev_info;
+    unsigned char command_buf[COMMAND_BUF_SIZE];
+    int was_ioctl;
+} dev_context_info_t;
+
 /******************** Function declarations ****************************/
 
 static int vintage_probe(struct pci_dev *, const struct pci_device_id *);
 static void vintage_remove(struct pci_dev *);
-ssize_t vintage_read(struct file *, char __user *, size_t, loff_t *);
 ssize_t vintage_write(struct file *, const char __user *, size_t, loff_t *);
+long vintage_ioctl(struct file *, unsigned int, unsigned long);
+int vintage_mmap(struct file *, struct vm_area_struct *);
 int vintage_open(struct inode *, struct file *);
 int vintage_release(struct inode *, struct file *);
+int vintage_fsync(struct file *, loff_t, loff_t, int);
 
 /******************** Global vaiables ****************************/
 
@@ -53,10 +63,13 @@ static struct pci_driver vintage_driver = {
 };
 static struct file_operations vintage_file_ops = {
     .owner = THIS_MODULE,
-    .read = vintage_read,
     .write = vintage_write,
+    .unlocked_ioctl = vintage_ioctl,
+    .compat_ioctl = vintage_ioctl,
+    .mmap = vintage_mmap,
     .open = vintage_open,
     .release = vintage_release,
+    .fsync = vintage_fsync
 };
 static dev_t dev_number;
 static unsigned int major;
@@ -66,28 +79,18 @@ static struct class *vintage_class;
 
 /******************** Definitions ****************************/
 
-ssize_t vintage_read(struct file *file, char __user *buffer,
-                     size_t size, loff_t *offset)
+void init_pci_dev_info(unsigned int first_minor)
 {
-    return 0;
+    int i;
+    for (i = 0; i < MAX_NUM_OF_DEVICES; ++i) {
+        pci_dev_info[i].device_number = i;
+        pci_dev_info[i].minor = first_minor++;
+        pci_dev_info[i].current_dev = MKDEV(major, pci_dev_info[i].minor);
+        pci_dev_info[i].pci_dev = NULL;
+        pci_dev_info[i].char_dev = NULL;
+        pci_dev_info[i].iomem = NULL;
+    }
 }
-
-ssize_t vintage_write(struct file *file, const char __user *buffer,
-                      size_t size, loff_t *offset)
-{
-    return 0;
-}
-
-int vintage_open(struct inode *inode, struct file *file)
-{
-    return 0;
-}
-
-int vintage_release(struct inode *inode, struct file *file)
-{
-    return 0;
-}
-
 
 pci_dev_info_t *get_first_free_device_info(void) {
     int i;
@@ -109,8 +112,78 @@ pci_dev_info_t *get_dev_info(struct pci_dev *dev) {
     return NULL;
 }
 
+pci_dev_info_t *get_dev_info_by_minor(int minor) {
+    int i;
+    for (i = 0; i < MAX_NUM_OF_DEVICES; ++i) {
+        if (pci_dev_info[i].minor == minor) {
+            return pci_dev_info + i;
+        }
+    }
+    return NULL;
+}
+
+
+ssize_t vintage_write(struct file *file, const char __user *buffer,
+                      size_t size, loff_t *offset)
+{
+    dev_context_info_t *dev_context = (dev_context_info_t *) file->private_data;
+    if (!dev_context->was_ioctl) {
+        return -EINVAL;
+    }
+
+    return 0;
+}
+
+long vintage_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    dev_context_info_t *dev_context = (dev_context_info_t *) file->private_data;
+    if (dev_context->was_ioctl) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
+int vintage_mmap(struct file *file, struct vm_area_struct *vma)
+{
+    dev_context_info_t *dev_context = (dev_context_info_t *) file->private_data;
+    if (!dev_context->was_ioctl) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
+int vintage_open(struct inode *inode, struct file *file)
+{
+    pci_dev_info_t *dev_info;
+    dev_context_info_t *dev_context_info;
+    int minor;
+
+    dev_context_info = kzalloc(sizeof(dev_context_info_t), GFP_KERNEL);
+    if (IS_ERR_OR_NULL(dev_context_info)) {
+        return -ENOMEM;
+    }
+    minor = iminor(inode);
+    dev_info = get_dev_info_by_minor(minor);
+    dev_context_info->pci_dev_info = dev_info;
+    file->private_data = (void *) dev_context_info;
+    return 0;
+}
+
+int vintage_release(struct inode *inode, struct file *file)
+{
+    kfree(file->private_data);
+    return 0;
+}
+
+int vintage_fsync(struct file *file, loff_t offset1, loff_t offset2,
+                  int datasync)
+{
+    return 0;
+}
+
 irqreturn_t irq_handler(int irq, void *dev)
 {
+    printk(KERN_WARNING "INTERRUPT! Irq: %d", irq);
     return IRQ_HANDLED;
 }
 
@@ -146,12 +219,13 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
         printk(KERN_ERR "Failed to add char device\n");
         return ret;
     }
-
+    // TODO: call device_create before cdev_add?
     device = device_create(vintage_class, NULL, pci_dev_info->current_dev,
                            NULL, "v2d%d", pci_dev_info->device_number);
     if (IS_ERR_OR_NULL(device)) {
         printk(KERN_ERR "Failed to create device\n");
         // TODO: Which error?
+
         ret = -ENODEV;
         goto device_create_failed;
     }
@@ -173,7 +247,6 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
         if (iomem == NULL) {
             ret = -ENOMEM;
         } else {
-            // FIXME: cast is ugly?
             ret = PTR_ERR(iomem);
         }
         goto pci_iomap_failed;
@@ -196,6 +269,10 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
     pci_dev_info->pci_dev = dev;
     pci_dev_info->char_dev = char_dev;
     pci_dev_info->iomem = iomem;
+
+    // FIXME: remove it
+    printk(KERN_DEBUG "%p\n", iomem);
+
     return 0;
 
 enable_device_failed:
@@ -251,18 +328,6 @@ static void vintage_remove(struct pci_dev *dev)
     }
 }
 
-void init_pci_dev_info(unsigned int first_minor)
-{
-    int i;
-    for (i = 0; i < MAX_NUM_OF_DEVICES; ++i) {
-        pci_dev_info[i].device_number = i;
-        pci_dev_info[i].minor = first_minor++;
-        pci_dev_info[i].current_dev = MKDEV(major, pci_dev_info[i].minor);
-        pci_dev_info[i].pci_dev = NULL;
-        pci_dev_info[i].char_dev = NULL;
-        pci_dev_info[i].iomem = NULL;
-    }
-}
 
 static int vintage_init_module(void)
 {
