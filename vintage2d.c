@@ -1,4 +1,5 @@
 #include <linux/cdev.h>
+#include <linux/dma-mapping.h>
 #include <linux/err.h>
 #include <linux/fs.h>
 #include <linux/irqreturn.h>
@@ -8,7 +9,9 @@
 #include <linux/io.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
+#include <linux/string.h>
 #include "vintage2d.h"
+#include "v2d_ioctl.h"
 
 
 MODULE_LICENSE("GPL");
@@ -29,6 +32,7 @@ typedef struct {
     dev_t current_dev;
     struct pci_dev *pci_dev;
     struct cdev *char_dev;
+    struct device *device;
     void __iomem *iomem;
 } pci_dev_info_t;
 
@@ -37,6 +41,12 @@ typedef struct {
     unsigned char command_buf[COMMAND_BUF_SIZE];
     int was_ioctl;
 } dev_context_info_t;
+
+typedef struct {
+    struct list_head pages;
+    void *cpu_addr;
+    dma_addr_t dma_addr;
+} canvas_page_list_t;
 
 /******************** Function declarations ****************************/
 
@@ -88,6 +98,7 @@ void init_pci_dev_info(unsigned int first_minor)
         pci_dev_info[i].current_dev = MKDEV(major, pci_dev_info[i].minor);
         pci_dev_info[i].pci_dev = NULL;
         pci_dev_info[i].char_dev = NULL;
+        pci_dev_info[i].device = NULL;
         pci_dev_info[i].iomem = NULL;
     }
 }
@@ -134,12 +145,47 @@ ssize_t vintage_write(struct file *file, const char __user *buffer,
     return 0;
 }
 
+int alloc_memory_for_canvas(unsigned int canvas_size,
+                            dev_context_info_t *dev_context)
+{
+    int num_of_pages_to_alloc, i;
+    canvas_page_list_t *page_table;
+    struct device *device;
+
+    device = dev_context->pci_dev_info->device;
+    page_table = (canvas_page_list_t *) kmalloc(sizeof(canvas_page_list_t),
+                                                GFP_KERNEL);
+    if (IS_ERR_OR_NULL(page_table)) {
+        printk(KERN_ERR "Failed to allocate memory\n");
+        return -ENOMEM;
+    }
+    page_table->cpu_addr = dma_zalloc_coherent(device, VINTAGE2D_PAGE_SIZE,
+                                               &page_table->dma_addr,
+                                               GFP_KERNEL);
+    if (IS_ERR_OR_NULL(page_table->cpu_addr)) {
+        printk(KERN_ERR "Failed to allocate memory for device\n");
+        kfree(page_table);
+        return -ENOMEM;
+    }
+    INIT_LIST_HEAD(&page_table->pages);
+    num_of_pages_to_alloc = canvas_size / VINTAGE2D_PAGE_SIZE;
+    for (i = 0; i < num_of_pages_to_alloc; ++i) {
+        
+    }
+}
+
 long vintage_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
-    dev_context_info_t *dev_context = (dev_context_info_t *) file->private_data;
+    struct v2d_ioctl_set_dimensions dimensions;
+    dev_context_info_t *dev_context;
+    if (cmd != V2D_IOCTL_SET_DIMENSIONS) {
+        return -EINVAL;
+    }
+    dev_context = (dev_context_info_t *) file->private_data;
     if (dev_context->was_ioctl) {
         return -EINVAL;
     }
+    memcpy(&dimensions, &arg, sizeof(struct v2d_ioctl_set_dimensions));
     return 0;
 }
 
@@ -160,6 +206,7 @@ int vintage_open(struct inode *inode, struct file *file)
 
     dev_context_info = kzalloc(sizeof(dev_context_info_t), GFP_KERNEL);
     if (IS_ERR_OR_NULL(dev_context_info)) {
+        printk(KERN_ERR "Failed to allocate memory");
         return -ENOMEM;
     }
     minor = iminor(inode);
@@ -186,8 +233,6 @@ irqreturn_t irq_handler(int irq, void *dev)
     printk(KERN_WARNING "INTERRUPT! Irq: %d", irq);
     return IRQ_HANDLED;
 }
-
-// TODO: goto everywhere
 
 static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
 {
@@ -255,19 +300,33 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
     ret = request_irq(dev->irq, irq_handler, IRQF_SHARED, DRIVER_NAME,
                       (void *) pci_dev_info);
     if (ret < 0) {
-        printk(KERN_ERR "Failed to request irq");
+        printk(KERN_ERR "Failed to request irq\n");
         goto request_irq_failed;
+    }
+
+    ret = pci_set_dma_mask(dev, DMA_BIT_MASK(32));
+    if (ret < 0) {
+        printk(KERN_ERR "Failed to set DMA mask\n");
+        goto set_dma_mask_or_enable_device_failed;
+    }
+
+    ret = pci_set_consistent_dma_mask(dev, DMA_BIT_MASK(32));
+    if (ret < 0) {
+        printk(KERN_ERR "Failed to set consistent DMA mask\n");
+        goto set_dma_mask_or_enable_device_failed;
     }
 
     ret = pci_enable_device(dev);
     if (ret < 0) {
         printk(KERN_ERR "Failed to enable device\n");
-        goto enable_device_failed;
+        goto set_dma_mask_or_enable_device_failed;
     }
 
     // Device successfully added
+    pci_set_master(dev);
     pci_dev_info->pci_dev = dev;
     pci_dev_info->char_dev = char_dev;
+    pci_dev_info->device = device;
     pci_dev_info->iomem = iomem;
 
     // FIXME: remove it
@@ -275,7 +334,7 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
 
     return 0;
 
-enable_device_failed:
+set_dma_mask_or_enable_device_failed:
     free_irq(dev->irq, iomem);
 request_irq_failed:
     pci_iounmap(dev, iomem);
@@ -291,6 +350,7 @@ device_create_failed:
 void remove_device(pci_dev_info_t *pci_dev_info)
 {
     if (pci_dev_info->pci_dev != NULL) {
+        pci_clear_master(pci_dev_info->pci_dev);
         printk(KERN_DEBUG "Removing device\n");
         pci_disable_device(pci_dev_info->pci_dev);
         printk(KERN_DEBUG "After disabling device\n");
@@ -305,6 +365,7 @@ void remove_device(pci_dev_info_t *pci_dev_info)
         printk(KERN_DEBUG "After release_regions\n");
         pci_dev_info->pci_dev = NULL;
         device_destroy(vintage_class, pci_dev_info->current_dev);
+        pci_dev_info->device = NULL;
         printk(KERN_DEBUG "After device_destroy\n");
     }
     if (pci_dev_info->char_dev != NULL) {
