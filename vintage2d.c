@@ -1,3 +1,5 @@
+#include <asm/uaccess.h>
+#include <linux/bug.h>
 #include <linux/cdev.h>
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
@@ -5,11 +7,11 @@
 #include <linux/irqreturn.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
+#include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/io.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
-#include <linux/string.h>
 #include "vintage2d.h"
 #include "v2d_ioctl.h"
 
@@ -23,6 +25,7 @@ MODULE_LICENSE("GPL");
 #define DEVICE_CLASS_NAME "Vintage"
 #define MMIO_SIZE 4096
 #define COMMAND_BUF_SIZE 65536
+#define PAGE_MASK 0xffffffff << VINTAGE2D_PAGE_SHIFT
 
 /******************** Typedefs ****************************/
 
@@ -37,16 +40,26 @@ typedef struct {
 } pci_dev_info_t;
 
 typedef struct {
+    void *cpu_addr;
+    dma_addr_t dma_addr;
+} vintage_page_t;
+
+typedef struct {
+    vintage_page_t page_table;
+    vintage_page_t *pages;
+    int num_of_pages;
+} canvas_page_info_t;
+
+typedef struct {
     pci_dev_info_t *pci_dev_info;
     unsigned char command_buf[COMMAND_BUF_SIZE];
     int was_ioctl;
+    canvas_page_info_t canvas_page_info;
+    uint16_t canvas_height;
+    uint16_t canvas_width;
 } dev_context_info_t;
 
-typedef struct {
-    struct list_head pages;
-    void *cpu_addr;
-    dma_addr_t dma_addr;
-} canvas_page_list_t;
+
 
 /******************** Function declarations ****************************/
 
@@ -145,39 +158,76 @@ ssize_t vintage_write(struct file *file, const char __user *buffer,
     return 0;
 }
 
-int alloc_memory_for_canvas(unsigned int canvas_size,
+void cleanup_canvas_pages(struct device *device,
+                          canvas_page_info_t *canvas_page_info,
+                          int num_of_pages_to_cleanup)
+{
+    int i;
+    dma_free_coherent(device, VINTAGE2D_PAGE_SIZE,
+                      canvas_page_info->page_table.cpu_addr,
+                      canvas_page_info->page_table.dma_addr);
+    for (i = 0; i < num_of_pages_to_cleanup; ++i) {
+        dma_free_coherent(device, VINTAGE2D_PAGE_SIZE,
+                          canvas_page_info->pages[i].cpu_addr,
+                          canvas_page_info->pages[i].dma_addr);
+    }
+    kfree(canvas_page_info->pages);
+    memset((void *) canvas_page_info, 0, sizeof(canvas_page_info_t));
+}
+
+int alloc_memory_for_canvas(uint16_t canvas_width, uint16_t canvas_height,
                             dev_context_info_t *dev_context)
 {
-    int num_of_pages_to_alloc, i;
-    canvas_page_list_t *page_table;
+    unsigned int num_of_pages_to_alloc, i, canvas_size;
+    unsigned int *page_entry_addr;
+    vintage_page_t *page_table;
+    vintage_page_t *current_page;
+    canvas_page_info_t *canvas_page_info;
     struct device *device;
 
+    canvas_size = canvas_width * canvas_height;
     device = dev_context->pci_dev_info->device;
-    page_table = (canvas_page_list_t *) kmalloc(sizeof(canvas_page_list_t),
-                                                GFP_KERNEL);
-    if (IS_ERR_OR_NULL(page_table)) {
-        printk(KERN_ERR "Failed to allocate memory\n");
-        return -ENOMEM;
-    }
+    canvas_page_info = &dev_context->canvas_page_info;
+    page_table = &canvas_page_info->page_table;
     page_table->cpu_addr = dma_zalloc_coherent(device, VINTAGE2D_PAGE_SIZE,
                                                &page_table->dma_addr,
                                                GFP_KERNEL);
     if (IS_ERR_OR_NULL(page_table->cpu_addr)) {
         printk(KERN_ERR "Failed to allocate memory for device\n");
-        kfree(page_table);
         return -ENOMEM;
     }
-    INIT_LIST_HEAD(&page_table->pages);
-    num_of_pages_to_alloc = canvas_size / VINTAGE2D_PAGE_SIZE;
+    num_of_pages_to_alloc = DIV_ROUND_UP(canvas_size, VINTAGE2D_PAGE_SIZE);
+    canvas_page_info->pages =
+            (vintage_page_t *) kzalloc(num_of_pages_to_alloc * sizeof(vintage_page_t),
+                                       GFP_KERNEL);
+    page_entry_addr = (unsigned int *) page_table->cpu_addr;
     for (i = 0; i < num_of_pages_to_alloc; ++i) {
-        
+        current_page = canvas_page_info->pages + i;
+        current_page->cpu_addr = dma_zalloc_coherent(device, VINTAGE2D_PAGE_SIZE,
+                                                     &current_page->dma_addr,
+                                                     GFP_KERNEL);
+        if (IS_ERR_OR_NULL(current_page->cpu_addr)) {
+            printk(KERN_ERR, "Failed to allocate memory for device\n");
+            cleanup_canvas_pages(device, canvas_page_info, i);
+            return -ENOMEM;
+        }
+        // TODO: Remove check and '& PAGE_MASK'
+        WARN_ON((current_page->dma_addr & PAGE_MASK) != current_page->dma_addr);
+        page_entry_addr[i] = (current_page->dma_addr & PAGE_MASK) | VINTAGE2D_PTE_VALID;
     }
+    /* Allocation successful */
+    canvas_page_info->num_of_pages = num_of_pages_to_alloc;
+    dev_context->canvas_height = canvas_height;
+    dev_context->canvas_width = canvas_width;
+    return 0;
 }
 
 long vintage_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     struct v2d_ioctl_set_dimensions dimensions;
     dev_context_info_t *dev_context;
+    int ret;
+
     if (cmd != V2D_IOCTL_SET_DIMENSIONS) {
         return -EINVAL;
     }
@@ -185,7 +235,18 @@ long vintage_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     if (dev_context->was_ioctl) {
         return -EINVAL;
     }
-    memcpy(&dimensions, &arg, sizeof(struct v2d_ioctl_set_dimensions));
+    if (copy_from_user((void *) &dimensions, (void *arg),
+            sizeof(struct v2d_ioctl_set_dimensions)) != 0) {
+        printk(KERN_ERR "Copying from user space failed\n");
+        return -EFAULT;
+    }
+    ret = alloc_memory_for_canvas(dimensions.width, dimensions.height,
+                                  dev_context);
+    if (ret < 0) {
+        return ret;
+    }
+    /* ioctl successful */
+    dev_context->was_ioctl = 1;
     return 0;
 }
 
@@ -206,7 +267,7 @@ int vintage_open(struct inode *inode, struct file *file)
 
     dev_context_info = kzalloc(sizeof(dev_context_info_t), GFP_KERNEL);
     if (IS_ERR_OR_NULL(dev_context_info)) {
-        printk(KERN_ERR "Failed to allocate memory");
+        printk(KERN_ERR "Failed to allocate memory\n");
         return -ENOMEM;
     }
     minor = iminor(inode);
