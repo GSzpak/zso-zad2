@@ -102,6 +102,9 @@ static struct class *vintage_class;
 
 /******************** Definitions ****************************/
 
+
+/******************** Utils ****************************/
+
 void init_pci_dev_info(unsigned int first_minor)
 {
     int i;
@@ -146,6 +149,7 @@ pci_dev_info_t *get_dev_info_by_minor(int minor) {
     return NULL;
 }
 
+/******************** Write ****************************/
 
 ssize_t vintage_write(struct file *file, const char __user *buffer,
                       size_t size, loff_t *offset)
@@ -158,9 +162,11 @@ ssize_t vintage_write(struct file *file, const char __user *buffer,
     return 0;
 }
 
+/******************** ioctl & alloc ****************************/
+
 void cleanup_canvas_pages(struct device *device,
                           canvas_page_info_t *canvas_page_info,
-                          unsigned int num_of_pages_to_cleanup)
+                          unsigned long num_of_pages_to_cleanup)
 {
     int i;
     dma_free_coherent(device, VINTAGE2D_PAGE_SIZE,
@@ -301,6 +307,14 @@ int vintage_open(struct inode *inode, struct file *file)
 
 int vintage_release(struct inode *inode, struct file *file)
 {
+    dev_context_info_t *dev_context_info;
+
+    dev_context_info = (dev_context_info_t *) file->private_data;
+    if (dev_context_info->was_ioctl) {
+        cleanup_canvas_pages(dev_context_info->pci_dev_info->device,
+                             &dev_context_info->canvas_page_info,
+                             dev_context_info->canvas_page_info.num_of_pages);
+    }
     kfree(file->private_data);
     return 0;
 }
@@ -315,6 +329,14 @@ irqreturn_t irq_handler(int irq, void *dev)
 {
     printk(KERN_WARNING "INTERRUPT! Irq: %d", irq);
     return IRQ_HANDLED;
+}
+
+void reset_device(pci_dev_info_t *dev_info)
+{
+    iowrite32(VINTAGE2D_RESET_DRAW | VINTAGE2D_RESET_FIFO | VINTAGE2D_RESET_TLB,
+              pci_dev_info->iomem + VINTAGE2D_RESET);
+    iowrite32(0x0, pci_dev_info->iomem + VINTAGE2D_CMD_READ_PTR);
+    iowrite32(0x0, pci_dev_info->iomem + VINTAGE2D_CMD_WRITE_PTR);
 }
 
 static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
@@ -405,15 +427,16 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
         goto set_dma_mask_or_enable_device_failed;
     }
 
-    // Device successfully added
+    /* Device successfully added */
     pci_set_master(dev);
     pci_dev_info->pci_dev = dev;
     pci_dev_info->char_dev = char_dev;
     pci_dev_info->device = device;
     pci_dev_info->iomem = iomem;
-
     // FIXME: remove it
-    printk(KERN_DEBUG "%p\n", iomem);
+    printk(KERN_DEBUG "IOMEM: %p\n", iomem);
+    /* Reset device */
+    reset_device(pci_dev_info);
 
     return 0;
 
