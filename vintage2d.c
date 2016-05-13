@@ -1,5 +1,4 @@
 #include <asm/uaccess.h>
-#include <asm-generic/page.h>
 #include <linux/bug.h>
 #include <linux/cdev.h>
 #include <linux/dma-mapping.h>
@@ -27,7 +26,6 @@ MODULE_LICENSE("GPL");
 #define DEVICE_CLASS_NAME "Vintage"
 #define MMIO_SIZE 4096
 #define COMMAND_BUF_SIZE 65536
-#define PAGE_MASK 0xffffffff << VINTAGE2D_PAGE_SHIFT
 
 /******************** Typedefs ****************************/
 
@@ -49,7 +47,7 @@ typedef struct {
 typedef struct {
     vintage_page_t page_table;
     vintage_page_t *pages;
-    unsigned int num_of_pages;
+    unsigned long num_of_pages;
 } canvas_page_info_t;
 
 typedef struct {
@@ -162,7 +160,7 @@ ssize_t vintage_write(struct file *file, const char __user *buffer,
 
 void cleanup_canvas_pages(struct device *device,
                           canvas_page_info_t *canvas_page_info,
-                          int num_of_pages_to_cleanup)
+                          unsigned int num_of_pages_to_cleanup)
 {
     int i;
     dma_free_coherent(device, VINTAGE2D_PAGE_SIZE,
@@ -180,8 +178,9 @@ void cleanup_canvas_pages(struct device *device,
 int alloc_memory_for_canvas(uint16_t canvas_width, uint16_t canvas_height,
                             dev_context_info_t *dev_context)
 {
-    unsigned int num_of_pages_to_alloc, i, canvas_size;
-    unsigned int *page_entry_addr;
+    unsigned int i;
+    unsigned long num_of_pages_to_alloc, canvas_size;
+    unsigned long *page_entry_addr;
     vintage_page_t *page_table;
     vintage_page_t *current_page;
     canvas_page_info_t *canvas_page_info;
@@ -202,14 +201,14 @@ int alloc_memory_for_canvas(uint16_t canvas_width, uint16_t canvas_height,
     canvas_page_info->pages =
             (vintage_page_t *) kzalloc(num_of_pages_to_alloc * sizeof(vintage_page_t),
                                        GFP_KERNEL);
-    page_entry_addr = (unsigned int *) page_table->cpu_addr;
+    page_entry_addr = (unsigned long *) page_table->cpu_addr;
     for (i = 0; i < num_of_pages_to_alloc; ++i) {
         current_page = canvas_page_info->pages + i;
         current_page->cpu_addr = dma_zalloc_coherent(device, VINTAGE2D_PAGE_SIZE,
                                                      &current_page->dma_addr,
                                                      GFP_KERNEL);
         if (IS_ERR_OR_NULL(current_page->cpu_addr)) {
-            printk(KERN_ERR, "Failed to allocate memory for device\n");
+            printk(KERN_ERR "Failed to allocate memory for device\n");
             cleanup_canvas_pages(device, canvas_page_info, i);
             return -ENOMEM;
         }
@@ -237,7 +236,7 @@ long vintage_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     if (dev_context->was_ioctl) {
         return -EINVAL;
     }
-    if (copy_from_user((void *) &dimensions, (void *arg),
+    if (copy_from_user((void *) &dimensions, (void *) arg,
             sizeof(struct v2d_ioctl_set_dimensions)) != 0) {
         printk(KERN_ERR "Copying from user space failed\n");
         return -EFAULT;
@@ -254,7 +253,8 @@ long vintage_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 int vintage_mmap(struct file *file, struct vm_area_struct *vma)
 {
-    unsigned int i, num_of_mmaped_pages, num_of_allocated_pages, offset, ret;
+    int ret;
+    unsigned long i, num_of_mmaped_pages, num_of_allocated_pages, offset;
     dev_context_info_t *dev_context;
     vintage_page_t *pages;
 
@@ -270,11 +270,11 @@ int vintage_mmap(struct file *file, struct vm_area_struct *vma)
     }
     for (i = 0; i < num_of_allocated_pages; ++i) {
         offset = i * VINTAGE2D_PAGE_SIZE;
-        ret = remap_pfn_range(vma, vma->vm_start, vma->vm_start + offset,
+        ret = remap_pfn_range(vma, vma->vm_start + offset,
                               __pa(pages[i].cpu_addr) >> PAGE_SHIFT,
                               VINTAGE2D_PAGE_SIZE, vma->vm_page_prot);
         if (ret < 0) {
-            pritnk(KERN_ERR "Mmap failed\n");
+            printk(KERN_ERR "Mmap failed\n");
             return ret;
         }
     }
