@@ -1,4 +1,5 @@
 #include <asm/uaccess.h>
+#include <asm-generic/page.h>
 #include <linux/bug.h>
 #include <linux/cdev.h>
 #include <linux/dma-mapping.h>
@@ -9,6 +10,7 @@
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/mm.h>
 #include <linux/io.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
@@ -47,7 +49,7 @@ typedef struct {
 typedef struct {
     vintage_page_t page_table;
     vintage_page_t *pages;
-    int num_of_pages;
+    unsigned int num_of_pages;
 } canvas_page_info_t;
 
 typedef struct {
@@ -252,9 +254,29 @@ long vintage_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 int vintage_mmap(struct file *file, struct vm_area_struct *vma)
 {
-    dev_context_info_t *dev_context = (dev_context_info_t *) file->private_data;
+    unsigned int i, num_of_mmaped_pages, num_of_allocated_pages, offset, ret;
+    dev_context_info_t *dev_context;
+    vintage_page_t *pages;
+
+    dev_context = (dev_context_info_t *) file->private_data;
     if (!dev_context->was_ioctl) {
         return -EINVAL;
+    }
+    num_of_allocated_pages = dev_context->canvas_page_info.num_of_pages;
+    pages = dev_context->canvas_page_info.pages;
+    num_of_mmaped_pages = (vma->vm_end - vma->vm_start) / VINTAGE2D_PAGE_SIZE;
+    if (num_of_mmaped_pages > num_of_allocated_pages) {
+        return -EINVAL;
+    }
+    for (i = 0; i < num_of_allocated_pages; ++i) {
+        offset = i * VINTAGE2D_PAGE_SIZE;
+        ret = remap_pfn_range(vma, vma->vm_start, vma->vm_start + offset,
+                              __pa(pages[i].cpu_addr) >> PAGE_SHIFT,
+                              VINTAGE2D_PAGE_SIZE, vma->vm_page_prot);
+        if (ret < 0) {
+            pritnk(KERN_ERR "Mmap failed\n");
+            return ret;
+        }
     }
     return 0;
 }
