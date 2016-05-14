@@ -21,11 +21,15 @@ MODULE_LICENSE("GPL");
 
 /******************** Defines ****************************/
 
-#define MAX_NUM_OF_DEVICES 256
-#define DRIVER_NAME "vintage2d-pci"
-#define DEVICE_CLASS_NAME "Vintage"
-#define MMIO_SIZE 4096
-#define COMMAND_BUF_SIZE 65536
+#define MAX_NUM_OF_DEVICES      256
+#define DRIVER_NAME     "vintage2d-pci"
+#define DEVICE_CLASS_NAME   "Vintage"
+#define MMIO_SIZE   4096
+#define COMMAND_BUF_SIZE    65536
+#define COMMAND_SIZE    4
+#define REQUIRED_POS_CMD_BITS_ZERO(cmd)     (((cmd) & 0x80040000) == 0)
+#define REQUIRED_FILL_COLOR_BITS_ZERO(cmd)     (((cmd) & 0x0000ffff) == 0)
+#define REQUIRED_DRAW_CMD_BITS_ZERO(cmd)     (((cmd) & 0x80040000) == 0)
 
 /******************** Typedefs ****************************/
 
@@ -51,12 +55,19 @@ typedef struct {
 } canvas_page_info_t;
 
 typedef struct {
+    long last_src_pos;
+    long last_dst_pos;
+    long last_fill_color;
+} command_info_t;
+
+typedef struct {
     pci_dev_info_t *pci_dev_info;
     unsigned char command_buf[COMMAND_BUF_SIZE];
     int was_ioctl;
     canvas_page_info_t canvas_page_info;
-    uint16_t canvas_height;
-    uint16_t canvas_width;
+    long canvas_height;
+    long canvas_width;
+    command_info_t command_info;
 } dev_context_info_t;
 
 
@@ -66,7 +77,7 @@ typedef struct {
 static int vintage_probe(struct pci_dev *, const struct pci_device_id *);
 static void vintage_remove(struct pci_dev *);
 ssize_t vintage_write(struct file *, const char __user *, size_t, loff_t *);
-long vintage_ioctl(struct file *, unsigned int, unsigned long);
+int vintage_ioctl(struct file *, unsigned int, unsigned long);
 int vintage_mmap(struct file *, struct vm_area_struct *);
 int vintage_open(struct inode *, struct file *);
 int vintage_release(struct inode *, struct file *);
@@ -151,14 +162,148 @@ pci_dev_info_t *get_dev_info_by_minor(int minor) {
 
 /******************** Write ****************************/
 
+void send_cmd(long cmd, dev_context_info_t *dev_context)
+{
+    iowrite32(cmd, dev_context->pci_dev_info->iomem + VINTAGE2D_FIFO_SEND);
+}
+
+int check_pos_cmd(long cmd, long x, long y, dev_context_info_t *dev_context)
+{
+    if (!REQUIRED_POS_CMD_BITS_ZERO(cmd) ||
+            x < 0 ||
+            x >= dev_context->canvas_width ||
+            y < 0 ||
+            y >= dev_context->canvas_height) {
+        return -1;
+    }
+    return 0;
+}
+
+int handle_src_pos_cmd(long cmd, dev_context_info_t *dev_context)
+{
+    long pos_x, pos_y;
+    pos_x = V2D_CMD_POS_X(cmd);
+    pos_y = V2D_CMD_POS_Y(cmd);
+    if (check_pos_cmd(cmd, pos_x, pos_y, dev_context) < 0) {
+        return -1;
+    }
+    send_cmd(VINTAGE2D_CMD_SRC_POS(pos_x, pos_y, 1), dev_context);
+    dev_context->command_info.last_src_pos = cmd;
+    return 0;
+}
+
+int handle_dst_pos_cmd(long cmd, dev_context_info_t *dev_context)
+{
+    long pos_x, pos_y;
+    pos_x = V2D_CMD_POS_X(cmd);
+    pos_y = V2D_CMD_POS_Y(cmd);
+    if (check_pos_cmd(cmd, pos_x, pos_y, dev_context) < 0) {
+        return -1;
+    }
+    send_cmd(VINTAGE2D_CMD_DST_POS(pos_x, pos_y, 1), dev_context);
+    dev_context->command_info.last_dst_pos = cmd;
+    return 0;
+}
+
+int handle_fill_color_cmd(long cmd, dev_context_info_t *dev_context)
+{
+    long color;
+    if (!REQUIRED_FILL_COLOR_BITS_ZERO(cmd)) {
+        return -1;
+    }
+    color = VINTAGE2D_CMD_COLOR(cmd);
+    send_cmd(VINTAGE2D_CMD_FILL_COLOR(color, 1), dev_context);
+    dev_context->command_info.last_fill_color = cmd;
+    return 0;
+}
+
+int handle_do_blit_cmd(long cmd, dev_context_info_t * dev_context)
+{
+    long src_pos_x, src_pos_y, dst_pos_x, dst_pos_y, width, height;
+    if (dev_context->command_info.last_src_pos == 0 ||
+            dev_context->command_info.last_dst_pos == 0) {
+        return -1;
+    }
+    src_pos_x = V2D_CMD_POS_X(dev_context->command_info.last_src_pos);
+    src_pos_y = V2D_CMD_POS_Y(dev_context->command_info.last_src_pos);
+    dst_pos_x = V2D_CMD_POS_X(dev_context->command_info.last_dst_pos);
+    dst_pos_y = V2D_CMD_POS_Y(dev_context->command_info.last_dst_pos);
+    width = V2D_CMD_WIDTH(cmd);
+    height = V2D_CMD_HEIGHT(cmd);
+    if (src_pos_x + width >= dev_context->canvas_width ||
+            dst_pos_x + width >= dev_context->canvas_width ||
+            src_pos_y + height >= dev_context->canvas_height ||
+            dst_pos_y + height >= dev_context->canvas_height) {
+        return -1;
+    }
+    send_cmd(VINTAGE2D_CMD_DO_BLIT(width, height, 1), dev_context);
+    dev_context->command_info.last_src_pos = 0;
+    dev_context->command_info.last_dst_pos = 0;
+}
+
+int handle_do_fill_cmd(long cmd, dev_context_info_t * dev_context)
+{
+    long dst_pos_x, dst_pos_y, width, height;
+    if (dev_context->command_info.last_fill_color == 0 ||
+            dev_context->command_info.last_dst_pos == 0) {
+        return -1;
+    }
+    dst_pos_x = V2D_CMD_POS_X(dev_context->command_info.last_dst_pos);
+    dst_pos_y = V2D_CMD_POS_Y(dev_context->command_info.last_dst_pos);
+    width = V2D_CMD_WIDTH(cmd);
+    height = V2D_CMD_HEIGHT(cmd);
+    if (dst_pos_x + width >= dev_context->canvas_width ||
+            dst_pos_y + height >= dev_context->canvas_height) {
+        return -1;
+    }
+    send_cmd(VINTAGE2D_CMD_DO_FILL(width, height, 1), dev_context);
+    dev_context->command_info.last_src_pos = 0;
+    dev_context->command_info.last_dst_pos = 0;
+}
+
 ssize_t vintage_write(struct file *file, const char __user *buffer,
                       size_t size, loff_t *offset)
 {
-    dev_context_info_t *dev_context = (dev_context_info_t *) file->private_data;
-    if (!dev_context->was_ioctl) {
+    long ret;
+    long current_command, i;
+    dev_context_info_t *dev_context;
+    int (*handle_cmd_function) (long, dev_context_info_t *);
+
+    dev_context = (dev_context_info_t *) file->private_data;
+    if (!dev_context->was_ioctl || size % COMMAND_SIZE != 0) {
         return -EINVAL;
     }
-
+    send_cmd(VINTAGE2D_CMD_CANVAS_PT(dev_context->canvas_page_info.page_table.dma_addr, 1),
+             dev_context);
+    send_cmd(VINTAGE2D_CMD_CANVAS_DIMS(dev_context->canvas_width, dev_context->canvas_height, 1),
+             dev_context);
+    for (i = 0; i < size; i += sizeof(unsigned long)) {
+        if (copy_from_user(&current_command, buffer, sizeof(unsigned long)) != 0) {
+            return -EAGAIN;
+        }
+        switch (V2D_CMD_TYPE(current_command)) {
+            case VINTAGE2D_CMD_TYPE_SRC_POS:
+                handle_cmd_function = handle_src_pos_cmd;
+                break;
+            case V2D_CMD_TYPE_DST_POS:
+                handle_cmd_function = handle_dst_pos_cmd;
+                break;
+            case V2D_CMD_TYPE_FILL_COLOR:
+                handle_cmd_function = handle_fill_color_cmd;
+                break;
+            case V2D_CMD_TYPE_DO_BLIT:
+                handle_cmd_function = handle_do_blit_cmd;
+                break;
+            case V2D_CMD_TYPE_DO_FILL:
+                handle_cmd_function = handle_do_fill_cmd;
+                break;
+            default:
+                return -EINVAL;
+        }
+        if (handle_cmd_function(current_command, dev_context) < 0) {
+            return -EINVAL;
+        }
+    }
     return 0;
 }
 
@@ -229,7 +374,7 @@ int alloc_memory_for_canvas(uint16_t canvas_width, uint16_t canvas_height,
     return 0;
 }
 
-long vintage_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+int vintage_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     struct v2d_ioctl_set_dimensions dimensions;
     dev_context_info_t *dev_context;
@@ -331,12 +476,22 @@ irqreturn_t irq_handler(int irq, void *dev)
     return IRQ_HANDLED;
 }
 
-void reset_device(pci_dev_info_t *dev_info)
+void start_device(pci_dev_info_t *dev_info)
 {
+    /* Reset device */
     iowrite32(VINTAGE2D_RESET_DRAW | VINTAGE2D_RESET_FIFO | VINTAGE2D_RESET_TLB,
               pci_dev_info->iomem + VINTAGE2D_RESET);
     iowrite32(0x0, pci_dev_info->iomem + VINTAGE2D_CMD_READ_PTR);
     iowrite32(0x0, pci_dev_info->iomem + VINTAGE2D_CMD_WRITE_PTR);
+    /* Enable interrupts */
+    iowrite32(VINTAGE2D_INTR_NOTIFY | VINTAGE2D_INTR_INVALID_CMD |
+              VINTAGE2D_INTR_PAGE_FAULT | VINTAGE2D_INTR_CANVAS_OVERFLOW |
+              VINTAGE2D_INTR_FIFO_OVERFLOW,
+              pci_dev_info->iomem + VINTAGE2D_INTR_ENABLE);
+    /* Enable drawing and fetching commands */
+    iowrite32(VINTAGE2D_ENABLE_DRAW | VINTAGE2D_ENABLE_FETCH_CMD,
+              pci_dev_info->iomem + VINTAGE2D_ENABLE);
+    // TODO: disable before release
 }
 
 static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
@@ -436,7 +591,7 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
     // FIXME: remove it
     printk(KERN_DEBUG "IOMEM: %p\n", iomem);
     /* Reset device */
-    reset_device(pci_dev_info);
+    start_device(pci_dev_info);
 
     return 0;
 
