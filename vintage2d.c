@@ -77,7 +77,7 @@ typedef struct {
 static int vintage_probe(struct pci_dev *, const struct pci_device_id *);
 static void vintage_remove(struct pci_dev *);
 ssize_t vintage_write(struct file *, const char __user *, size_t, loff_t *);
-int vintage_ioctl(struct file *, unsigned int, unsigned long);
+long vintage_ioctl(struct file *, unsigned int, unsigned long);
 int vintage_mmap(struct file *, struct vm_area_struct *);
 int vintage_open(struct inode *, struct file *);
 int vintage_release(struct inode *, struct file *);
@@ -239,6 +239,7 @@ int handle_do_blit_cmd(long cmd, dev_context_info_t * dev_context)
     send_cmd(VINTAGE2D_CMD_DO_BLIT(width, height, 1), dev_context);
     dev_context->command_info.last_src_pos = 0;
     dev_context->command_info.last_dst_pos = 0;
+    return 0;
 }
 
 int handle_do_fill_cmd(long cmd, dev_context_info_t * dev_context)
@@ -259,12 +260,12 @@ int handle_do_fill_cmd(long cmd, dev_context_info_t * dev_context)
     send_cmd(VINTAGE2D_CMD_DO_FILL(width, height, 1), dev_context);
     dev_context->command_info.last_src_pos = 0;
     dev_context->command_info.last_dst_pos = 0;
+    return 0;
 }
 
 ssize_t vintage_write(struct file *file, const char __user *buffer,
                       size_t size, loff_t *offset)
 {
-    long ret;
     long current_command, i;
     dev_context_info_t *dev_context;
     int (*handle_cmd_function) (long, dev_context_info_t *);
@@ -279,7 +280,7 @@ ssize_t vintage_write(struct file *file, const char __user *buffer,
              dev_context);
     for (i = 0; i < size; i += sizeof(unsigned long)) {
         if (copy_from_user(&current_command, buffer, sizeof(unsigned long)) != 0) {
-            return -EAGAIN;
+            return -EINVAL;
         }
         switch (V2D_CMD_TYPE(current_command)) {
             case VINTAGE2D_CMD_TYPE_SRC_POS:
@@ -374,11 +375,11 @@ int alloc_memory_for_canvas(uint16_t canvas_width, uint16_t canvas_height,
     return 0;
 }
 
-int vintage_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+long vintage_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     struct v2d_ioctl_set_dimensions dimensions;
     dev_context_info_t *dev_context;
-    int ret;
+    long ret;
 
     if (cmd != V2D_IOCTL_SET_DIMENSIONS) {
         return -EINVAL;
@@ -404,7 +405,6 @@ int vintage_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 int vintage_mmap(struct file *file, struct vm_area_struct *vma)
 {
-    int ret;
     unsigned long i, num_of_mmaped_pages, num_of_allocated_pages, offset;
     dev_context_info_t *dev_context;
     vintage_page_t *pages;
@@ -421,12 +421,11 @@ int vintage_mmap(struct file *file, struct vm_area_struct *vma)
     }
     for (i = 0; i < num_of_allocated_pages; ++i) {
         offset = i * VINTAGE2D_PAGE_SIZE;
-        ret = remap_pfn_range(vma, vma->vm_start + offset,
-                              __pa(pages[i].cpu_addr) >> PAGE_SHIFT,
-                              VINTAGE2D_PAGE_SIZE, vma->vm_page_prot);
-        if (ret < 0) {
+        if (remap_pfn_range(vma, vma->vm_start + offset,
+                            __pa(pages[i].cpu_addr) >> PAGE_SHIFT,
+                            VINTAGE2D_PAGE_SIZE, vma->vm_page_prot) < 0) {
             printk(KERN_ERR "Mmap failed\n");
-            return ret;
+            return -EAGAIN;
         }
     }
     return 0;
