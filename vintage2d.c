@@ -13,6 +13,7 @@
 #include <linux/io.h>
 #include <linux/pci.h>
 #include <linux/slab.h>
+#include <linux/delay.h>
 #include "vintage2d.h"
 #include "v2d_ioctl.h"
 
@@ -27,19 +28,22 @@ MODULE_LICENSE("GPL");
 #define MMIO_SIZE   4096
 #define COMMAND_BUF_SIZE    65536
 #define COMMAND_SIZE    4
-#define REQUIRED_POS_CMD_BITS_ZERO(cmd)     (((cmd) & 0x80040000) == 0)
-#define REQUIRED_FILL_COLOR_BITS_ZERO(cmd)     (((cmd) & 0x0000ffff) == 0)
-#define REQUIRED_DRAW_CMD_BITS_ZERO(cmd)     (((cmd) & 0x80040000) == 0)
+#define MAX_WIDTH 2048
+#define MAX_HEIGHT 2048
+#define MIN_WIDTH 1
+#define MIN_HEIGHT 1
+#define REQUIRED_POS_CMD_BITS_ZERO(cmd)     (((cmd) & (1 << 19 | 1 << 31)) == 0)
+#define REQUIRED_FILL_COLOR_BITS_ZERO(cmd)     (((cmd) & 0xffff0000) == 0)
+#define REQUIRED_DRAW_CMD_BITS_ZERO(cmd)     (((cmd) & (1 << 19 | 1 << 31)) == 0)
 
 /******************** Typedefs ****************************/
 
 typedef struct {
     int device_number;
     unsigned int minor;
-    dev_t current_dev;
+    dev_t dev_number;
     struct pci_dev *pci_dev;
     struct cdev *char_dev;
-    struct device *device;
     void __iomem *iomem;
 } pci_dev_info_t;
 
@@ -110,7 +114,6 @@ static unsigned int major;
 static pci_dev_info_t pci_dev_info[MAX_NUM_OF_DEVICES];
 static struct class *vintage_class;
 
-
 /******************** Definitions ****************************/
 
 
@@ -122,10 +125,9 @@ void init_pci_dev_info(unsigned int first_minor)
     for (i = 0; i < MAX_NUM_OF_DEVICES; ++i) {
         pci_dev_info[i].device_number = i;
         pci_dev_info[i].minor = first_minor++;
-        pci_dev_info[i].current_dev = MKDEV(major, pci_dev_info[i].minor);
+        pci_dev_info[i].dev_number = MKDEV(major, pci_dev_info[i].minor);
         pci_dev_info[i].pci_dev = NULL;
         pci_dev_info[i].char_dev = NULL;
-        pci_dev_info[i].device = NULL;
         pci_dev_info[i].iomem = NULL;
     }
 }
@@ -169,6 +171,8 @@ void send_cmd(long cmd, dev_context_info_t *dev_context)
 
 int check_pos_cmd(long cmd, long x, long y, dev_context_info_t *dev_context)
 {
+    printk(KERN_DEBUG "Check pos: x %d, y %d, width %d, height %d\n", x, y,
+           dev_context->canvas_width, dev_context->canvas_height);
     if (!REQUIRED_POS_CMD_BITS_ZERO(cmd) ||
             x < 0 ||
             x >= dev_context->canvas_width ||
@@ -185,6 +189,7 @@ int handle_src_pos_cmd(long cmd, dev_context_info_t *dev_context)
     pos_x = V2D_CMD_POS_X(cmd);
     pos_y = V2D_CMD_POS_Y(cmd);
     if (check_pos_cmd(cmd, pos_x, pos_y, dev_context) < 0) {
+        printk(KERN_DEBUG "Check_pos failed");
         return -1;
     }
     send_cmd(VINTAGE2D_CMD_SRC_POS(pos_x, pos_y, 1), dev_context);
@@ -208,7 +213,9 @@ int handle_dst_pos_cmd(long cmd, dev_context_info_t *dev_context)
 int handle_fill_color_cmd(long cmd, dev_context_info_t *dev_context)
 {
     long color;
+    printk(KERN_DEBUG "color %p", cmd);
     if (!REQUIRED_FILL_COLOR_BITS_ZERO(cmd)) {
+        printk(KERN_DEBUG "check color failed");
         return -1;
     }
     color = VINTAGE2D_CMD_COLOR(cmd);
@@ -220,7 +227,8 @@ int handle_fill_color_cmd(long cmd, dev_context_info_t *dev_context)
 int handle_do_blit_cmd(long cmd, dev_context_info_t * dev_context)
 {
     long src_pos_x, src_pos_y, dst_pos_x, dst_pos_y, width, height;
-    if (dev_context->command_info.last_src_pos == 0 ||
+    if (!REQUIRED_DRAW_CMD_BITS_ZERO(cmd) ||
+            dev_context->command_info.last_src_pos == 0 ||
             dev_context->command_info.last_dst_pos == 0) {
         return -1;
     }
@@ -230,10 +238,12 @@ int handle_do_blit_cmd(long cmd, dev_context_info_t * dev_context)
     dst_pos_y = V2D_CMD_POS_Y(dev_context->command_info.last_dst_pos);
     width = V2D_CMD_WIDTH(cmd);
     height = V2D_CMD_HEIGHT(cmd);
-    if (src_pos_x + width >= dev_context->canvas_width ||
-            dst_pos_x + width >= dev_context->canvas_width ||
-            src_pos_y + height >= dev_context->canvas_height ||
-            dst_pos_y + height >= dev_context->canvas_height) {
+    printk(KERN_DEBUG "Check blit: src_x %d, src_y %d, dst_x %d, dst_y %d, width %d, height %d\n",
+           src_pos_x, src_pos_y, dst_pos_x, dst_pos_y, width, height);
+    if (src_pos_x + width > dev_context->canvas_width ||
+            dst_pos_x + width > dev_context->canvas_width ||
+            src_pos_y + height > dev_context->canvas_height ||
+            dst_pos_y + height > dev_context->canvas_height) {
         return -1;
     }
     send_cmd(VINTAGE2D_CMD_DO_BLIT(width, height, 1), dev_context);
@@ -245,7 +255,8 @@ int handle_do_blit_cmd(long cmd, dev_context_info_t * dev_context)
 int handle_do_fill_cmd(long cmd, dev_context_info_t * dev_context)
 {
     long dst_pos_x, dst_pos_y, width, height;
-    if (dev_context->command_info.last_fill_color == 0 ||
+    if (!REQUIRED_DRAW_CMD_BITS_ZERO(cmd) ||
+            dev_context->command_info.last_fill_color == 0 ||
             dev_context->command_info.last_dst_pos == 0) {
         return -1;
     }
@@ -253,8 +264,8 @@ int handle_do_fill_cmd(long cmd, dev_context_info_t * dev_context)
     dst_pos_y = V2D_CMD_POS_Y(dev_context->command_info.last_dst_pos);
     width = V2D_CMD_WIDTH(cmd);
     height = V2D_CMD_HEIGHT(cmd);
-    if (dst_pos_x + width >= dev_context->canvas_width ||
-            dst_pos_y + height >= dev_context->canvas_height) {
+    if (dst_pos_x + width > dev_context->canvas_width ||
+            dst_pos_y + height > dev_context->canvas_height) {
         return -1;
     }
     send_cmd(VINTAGE2D_CMD_DO_FILL(width, height, 1), dev_context);
@@ -272,6 +283,7 @@ ssize_t vintage_write(struct file *file, const char __user *buffer,
 
     dev_context = (dev_context_info_t *) file->private_data;
     if (!dev_context->was_ioctl || size % COMMAND_SIZE != 0) {
+        printk(KERN_DEBUG "invalid command\n");
         return -EINVAL;
     }
     send_cmd(VINTAGE2D_CMD_CANVAS_PT(dev_context->canvas_page_info.page_table.dma_addr, 1),
@@ -279,33 +291,42 @@ ssize_t vintage_write(struct file *file, const char __user *buffer,
     send_cmd(VINTAGE2D_CMD_CANVAS_DIMS(dev_context->canvas_width, dev_context->canvas_height, 1),
              dev_context);
     for (i = 0; i < size; i += sizeof(unsigned long)) {
-        if (copy_from_user(&current_command, buffer, sizeof(unsigned long)) != 0) {
-            return -EINVAL;
+        if (copy_from_user(&current_command, buffer + i,
+                sizeof(unsigned long)) != 0) {
+            printk(KERN_DEBUG "Write efault\n");
+            return -EFAULT;
         }
         switch (V2D_CMD_TYPE(current_command)) {
             case VINTAGE2D_CMD_TYPE_SRC_POS:
+                printk(KERN_DEBUG "src pos\n");
                 handle_cmd_function = handle_src_pos_cmd;
                 break;
             case V2D_CMD_TYPE_DST_POS:
+                printk(KERN_DEBUG "dst pos\n");
                 handle_cmd_function = handle_dst_pos_cmd;
                 break;
             case V2D_CMD_TYPE_FILL_COLOR:
+                printk(KERN_DEBUG "fill\n");
                 handle_cmd_function = handle_fill_color_cmd;
                 break;
             case V2D_CMD_TYPE_DO_BLIT:
+                printk(KERN_DEBUG "do blit\n");
                 handle_cmd_function = handle_do_blit_cmd;
                 break;
             case V2D_CMD_TYPE_DO_FILL:
+                printk(KERN_DEBUG "do fill\n");
                 handle_cmd_function = handle_do_fill_cmd;
                 break;
             default:
                 return -EINVAL;
         }
         if (handle_cmd_function(current_command, dev_context) < 0) {
+            printk(KERN_DEBUG "Invalid command\n");
             return -EINVAL;
         }
     }
-    return 0;
+    printk(KERN_DEBUG "Success %d\n", i);
+    return i;
 }
 
 /******************** ioctl & alloc ****************************/
@@ -338,15 +359,17 @@ int alloc_memory_for_canvas(uint16_t canvas_width, uint16_t canvas_height,
     canvas_page_info_t *canvas_page_info;
     struct device *device;
 
+    printk(KERN_WARNING "Height: %d, width: %d\n", canvas_height, canvas_width);
+
     canvas_size = canvas_width * canvas_height;
-    device = dev_context->pci_dev_info->device;
+    device = &dev_context->pci_dev_info->pci_dev->dev;
     canvas_page_info = &dev_context->canvas_page_info;
     page_table = &canvas_page_info->page_table;
-    page_table->cpu_addr = dma_zalloc_coherent(device, VINTAGE2D_PAGE_SIZE,
+    page_table->cpu_addr = dma_zalloc_coherent(device, 4096,
                                                &page_table->dma_addr,
                                                GFP_KERNEL);
     if (IS_ERR_OR_NULL(page_table->cpu_addr)) {
-        printk(KERN_ERR "Failed to allocate memory for device\n");
+        printk(KERN_ERR "Failed to allocate memory for device's page table\n");
         return -ENOMEM;
     }
     num_of_pages_to_alloc = DIV_ROUND_UP(canvas_size, VINTAGE2D_PAGE_SIZE);
@@ -360,7 +383,7 @@ int alloc_memory_for_canvas(uint16_t canvas_width, uint16_t canvas_height,
                                                      &current_page->dma_addr,
                                                      GFP_KERNEL);
         if (IS_ERR_OR_NULL(current_page->cpu_addr)) {
-            printk(KERN_ERR "Failed to allocate memory for device\n");
+            printk(KERN_ERR "Failed to allocate memory for device's page\n");
             cleanup_canvas_pages(device, canvas_page_info, i);
             return -ENOMEM;
         }
@@ -380,9 +403,9 @@ long vintage_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     struct v2d_ioctl_set_dimensions dimensions;
     dev_context_info_t *dev_context;
     long ret;
-
+    printk(KERN_WARNING "IOCTL\n");
     if (cmd != V2D_IOCTL_SET_DIMENSIONS) {
-        return -EINVAL;
+        return -ENOTTY;
     }
     dev_context = (dev_context_info_t *) file->private_data;
     if (dev_context->was_ioctl) {
@@ -393,6 +416,12 @@ long vintage_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         printk(KERN_ERR "Copying from user space failed\n");
         return -EFAULT;
     }
+    if (dimensions.width < MIN_WIDTH ||
+            dimensions.width > MAX_WIDTH ||
+            dimensions.height < MIN_HEIGHT ||
+            dimensions.height > MAX_HEIGHT) {
+        return -EINVAL;
+    }
     ret = alloc_memory_for_canvas(dimensions.width, dimensions.height,
                                   dev_context);
     if (ret < 0) {
@@ -400,6 +429,8 @@ long vintage_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     }
     /* ioctl successful */
     dev_context->was_ioctl = 1;
+    /* Enable drawing and fetching commands */
+    iowrite32(VINTAGE2D_ENABLE_DRAW, pci_dev_info->iomem + VINTAGE2D_ENABLE);
     return 0;
 }
 
@@ -408,7 +439,7 @@ int vintage_mmap(struct file *file, struct vm_area_struct *vma)
     unsigned long i, num_of_mmaped_pages, num_of_allocated_pages, offset;
     dev_context_info_t *dev_context;
     vintage_page_t *pages;
-
+    printk(KERN_WARNING "MMAP\n");
     dev_context = (dev_context_info_t *) file->private_data;
     if (!dev_context->was_ioctl) {
         return -EINVAL;
@@ -455,7 +486,7 @@ int vintage_release(struct inode *inode, struct file *file)
 
     dev_context_info = (dev_context_info_t *) file->private_data;
     if (dev_context_info->was_ioctl) {
-        cleanup_canvas_pages(dev_context_info->pci_dev_info->device,
+        cleanup_canvas_pages(&dev_context_info->pci_dev_info->pci_dev->dev,
                              &dev_context_info->canvas_page_info,
                              dev_context_info->canvas_page_info.num_of_pages);
     }
@@ -466,30 +497,52 @@ int vintage_release(struct inode *inode, struct file *file)
 int vintage_fsync(struct file *file, loff_t offset1, loff_t offset2,
                   int datasync)
 {
+    mdelay(2000);
     return 0;
 }
 
 irqreturn_t irq_handler(int irq, void *dev)
 {
-    printk(KERN_WARNING "INTERRUPT! Irq: %d", irq);
+    int interrupt;
+    pci_dev_info_t *dev_info = (pci_dev_info_t *) dev;
+    interrupt = ioread32(dev_info->iomem + VINTAGE2D_INTR);
+    if (interrupt & VINTAGE2D_INTR_NOTIFY) {
+        printk(KERN_WARNING "INTERRUPT: notify");
+    }
+    if (interrupt & VINTAGE2D_INTR_INVALID_CMD) {
+        printk(KERN_WARNING "INTERRUPT: invalid_cmd");
+    }
+    if (interrupt & VINTAGE2D_INTR_PAGE_FAULT) {
+        printk(KERN_WARNING "INTERRUPT: page fault");
+    }
+    if (interrupt & VINTAGE2D_INTR_CANVAS_OVERFLOW) {
+        printk(KERN_WARNING "INTERRUPT: canvas overflow");
+    }
+    if (interrupt & VINTAGE2D_INTR_FIFO_OVERFLOW) {
+        printk(KERN_WARNING "INTERRUPT: fifo overflow");
+    }
+    iowrite32(interrupt, dev_info->iomem + VINTAGE2D_INTR);
     return IRQ_HANDLED;
 }
 
 void start_device(pci_dev_info_t *dev_info)
 {
     /* Reset device */
+    iowrite32(VINTAGE2D_INTR_NOTIFY | VINTAGE2D_INTR_INVALID_CMD |
+              VINTAGE2D_INTR_PAGE_FAULT | VINTAGE2D_INTR_CANVAS_OVERFLOW |
+              VINTAGE2D_INTR_FIFO_OVERFLOW,
+              pci_dev_info->iomem + VINTAGE2D_INTR);
+    //iowrite32(0x0, pci_dev_info->iomem + VINTAGE2D_CMD_READ_PTR);
+    //iowrite32(0x0, pci_dev_info->iomem + VINTAGE2D_CMD_WRITE_PTR);
     iowrite32(VINTAGE2D_RESET_DRAW | VINTAGE2D_RESET_FIFO | VINTAGE2D_RESET_TLB,
               pci_dev_info->iomem + VINTAGE2D_RESET);
-    iowrite32(0x0, pci_dev_info->iomem + VINTAGE2D_CMD_READ_PTR);
-    iowrite32(0x0, pci_dev_info->iomem + VINTAGE2D_CMD_WRITE_PTR);
     /* Enable interrupts */
     iowrite32(VINTAGE2D_INTR_NOTIFY | VINTAGE2D_INTR_INVALID_CMD |
               VINTAGE2D_INTR_PAGE_FAULT | VINTAGE2D_INTR_CANVAS_OVERFLOW |
               VINTAGE2D_INTR_FIFO_OVERFLOW,
               pci_dev_info->iomem + VINTAGE2D_INTR_ENABLE);
     /* Enable drawing and fetching commands */
-    iowrite32(VINTAGE2D_ENABLE_DRAW | VINTAGE2D_ENABLE_FETCH_CMD,
-              pci_dev_info->iomem + VINTAGE2D_ENABLE);
+    //iowrite32(VINTAGE2D_ENABLE_DRAW, pci_dev_info->iomem + VINTAGE2D_ENABLE);
     // TODO: disable before release
 }
 
@@ -517,14 +570,14 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
     }
     char_dev->owner = THIS_MODULE;
     char_dev->ops = &vintage_file_ops;
-    ret = cdev_add(char_dev, pci_dev_info->current_dev, 1);
+    ret = cdev_add(char_dev, pci_dev_info->dev_number, 1);
     if (ret < 0) {
         // TODO: Free char_dev?
         printk(KERN_ERR "Failed to add char device\n");
         return ret;
     }
     // TODO: call device_create before cdev_add?
-    device = device_create(vintage_class, NULL, pci_dev_info->current_dev,
+    device = device_create(vintage_class, NULL, pci_dev_info->dev_number,
                            NULL, "v2d%d", pci_dev_info->device_number);
     if (IS_ERR_OR_NULL(device)) {
         printk(KERN_ERR "Failed to create device\n");
@@ -563,12 +616,13 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
         goto request_irq_failed;
     }
 
+    pci_set_master(dev);
+
     ret = pci_set_dma_mask(dev, DMA_BIT_MASK(32));
     if (ret < 0) {
         printk(KERN_ERR "Failed to set DMA mask\n");
         goto set_dma_mask_or_enable_device_failed;
     }
-
     ret = pci_set_consistent_dma_mask(dev, DMA_BIT_MASK(32));
     if (ret < 0) {
         printk(KERN_ERR "Failed to set consistent DMA mask\n");
@@ -582,10 +636,8 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
     }
 
     /* Device successfully added */
-    pci_set_master(dev);
     pci_dev_info->pci_dev = dev;
     pci_dev_info->char_dev = char_dev;
-    pci_dev_info->device = device;
     pci_dev_info->iomem = iomem;
     // FIXME: remove it
     printk(KERN_DEBUG "IOMEM: %p\n", iomem);
@@ -595,13 +647,14 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
     return 0;
 
 set_dma_mask_or_enable_device_failed:
-    free_irq(dev->irq, iomem);
+    pci_clear_master(dev);
+    free_irq(dev->irq, (void *) pci_dev_info);
 request_irq_failed:
     pci_iounmap(dev, iomem);
 pci_iomap_failed:
     pci_release_regions(dev);
 pci_request_regions_failed:
-    device_destroy(vintage_class, pci_dev_info->current_dev);
+    device_destroy(vintage_class, pci_dev_info->dev_number);
 device_create_failed:
     cdev_del(char_dev);
     return ret;
@@ -610,27 +663,21 @@ device_create_failed:
 void remove_device(pci_dev_info_t *pci_dev_info)
 {
     if (pci_dev_info->pci_dev != NULL) {
-        pci_clear_master(pci_dev_info->pci_dev);
         printk(KERN_DEBUG "Removing device\n");
+        /* Disable device */
+        iowrite32(0x0, pci_dev_info->iomem + VINTAGE2D_INTR_ENABLE);
+        iowrite32(0x0, pci_dev_info->iomem + VINTAGE2D_ENABLE);
         pci_disable_device(pci_dev_info->pci_dev);
-        printk(KERN_DEBUG "After disabling device\n");
+        pci_clear_master(pci_dev_info->pci_dev);
         free_irq(pci_dev_info->pci_dev->irq, (void *) pci_dev_info);
-        printk(KERN_DEBUG "After free_irq\n");
-        if (pci_dev_info->iomem != NULL) {
-            pci_iounmap(pci_dev_info->pci_dev, pci_dev_info->iomem);
-            printk(KERN_DEBUG "After iounmap\n");
-            pci_dev_info->iomem = NULL;
-        }
+        pci_iounmap(pci_dev_info->pci_dev, pci_dev_info->iomem);
+        pci_dev_info->iomem = NULL;
         pci_release_regions(pci_dev_info->pci_dev);
-        printk(KERN_DEBUG "After release_regions\n");
         pci_dev_info->pci_dev = NULL;
-        device_destroy(vintage_class, pci_dev_info->current_dev);
-        pci_dev_info->device = NULL;
-        printk(KERN_DEBUG "After device_destroy\n");
+        device_destroy(vintage_class, pci_dev_info->dev_number);
     }
     if (pci_dev_info->char_dev != NULL) {
         cdev_del(pci_dev_info->char_dev);
-        printk(KERN_DEBUG "After cdev_del\n");
         pci_dev_info->char_dev = NULL;
     }
 }
