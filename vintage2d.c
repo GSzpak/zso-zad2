@@ -10,33 +10,40 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mm.h>
+#include <linux/mutex.h>
 #include <linux/io.h>
 #include <linux/pci.h>
+#include <linux/semaphore.h>
 #include <linux/slab.h>
 #include <linux/delay.h>
 #include "vintage2d.h"
 #include "v2d_ioctl.h"
 
-
+// TODO: remove delay.h
 MODULE_LICENSE("GPL");
 
 /******************** Defines ****************************/
 
 #define MAX_NUM_OF_DEVICES      256
-#define DRIVER_NAME     "vintage2d-pci"
-#define DEVICE_CLASS_NAME   "Vintage"
-#define MMIO_SIZE   4096
-#define COMMAND_BUF_SIZE    65536
-#define COMMAND_SIZE    4
-#define MAX_WIDTH 2048
-#define MAX_HEIGHT 2048
-#define MIN_WIDTH 1
-#define MIN_HEIGHT 1
+#define DRIVER_NAME             "vintage2d-pci"
+#define DEVICE_CLASS_NAME       "graphic"
+#define MMIO_SIZE               4096
+#define COMMAND_BUF_SIZE        65536
+#define COMMAND_SIZE            4
+#define MAX_WIDTH               2048
+#define MAX_HEIGHT              2048
+#define MIN_WIDTH               1
+#define MIN_HEIGHT              1
 #define REQUIRED_POS_CMD_BITS_ZERO(cmd)     (((cmd) & (1 << 19 | 1 << 31)) == 0)
-#define REQUIRED_FILL_COLOR_BITS_ZERO(cmd)     (((cmd) & 0xffff0000) == 0)
-#define REQUIRED_DRAW_CMD_BITS_ZERO(cmd)     (((cmd) & (1 << 19 | 1 << 31)) == 0)
+#define REQUIRED_FILL_COLOR_BITS_ZERO(cmd)  (((cmd) & 0xffff0000) == 0)
+#define REQUIRED_DRAW_CMD_BITS_ZERO(cmd)    (((cmd) & (1 << 19 | 1 << 31)) == 0)
 
 /******************** Typedefs ****************************/
+
+typedef struct {
+    void *cpu_addr;
+    dma_addr_t dma_addr;
+} vintage_mem_t;
 
 typedef struct {
     int device_number;
@@ -45,16 +52,13 @@ typedef struct {
     struct pci_dev *pci_dev;
     struct cdev *char_dev;
     void __iomem *iomem;
+    vintage_mem_t command_buf;
+    struct semaphore sem;
 } pci_dev_info_t;
 
 typedef struct {
-    void *cpu_addr;
-    dma_addr_t dma_addr;
-} vintage_page_t;
-
-typedef struct {
-    vintage_page_t page_table;
-    vintage_page_t *pages;
+    vintage_mem_t page_table;
+    vintage_mem_t *pages;
     unsigned long num_of_pages;
 } canvas_page_info_t;
 
@@ -66,14 +70,13 @@ typedef struct {
 
 typedef struct {
     pci_dev_info_t *pci_dev_info;
-    unsigned char command_buf[COMMAND_BUF_SIZE];
     int was_ioctl;
     canvas_page_info_t canvas_page_info;
     long canvas_height;
     long canvas_width;
     command_info_t command_info;
+    struct semaphore sem;
 } dev_context_info_t;
-
 
 
 /******************** Function declarations ****************************/
@@ -129,9 +132,11 @@ void init_pci_dev_info(unsigned int first_minor)
         pci_dev_info[i].pci_dev = NULL;
         pci_dev_info[i].char_dev = NULL;
         pci_dev_info[i].iomem = NULL;
+        pci_dev_info->command_buf.cpu_addr = NULL;
+        pci_dev_info->command_buf.dma_addr = 0;
     }
 }
-
+// TODO: Synchronization in probe / remove?
 pci_dev_info_t *get_first_free_device_info(void) {
     int i;
     for (i = 0; i < MAX_NUM_OF_DEVICES; ++i) {
@@ -354,8 +359,8 @@ int alloc_memory_for_canvas(uint16_t canvas_width, uint16_t canvas_height,
     unsigned int i;
     unsigned long num_of_pages_to_alloc, canvas_size;
     unsigned long *page_entry_addr;
-    vintage_page_t *page_table;
-    vintage_page_t *current_page;
+    vintage_mem_t *page_table;
+    vintage_mem_t *current_page;
     canvas_page_info_t *canvas_page_info;
     struct device *device;
 
@@ -365,7 +370,7 @@ int alloc_memory_for_canvas(uint16_t canvas_width, uint16_t canvas_height,
     device = &dev_context->pci_dev_info->pci_dev->dev;
     canvas_page_info = &dev_context->canvas_page_info;
     page_table = &canvas_page_info->page_table;
-    page_table->cpu_addr = dma_zalloc_coherent(device, 4096,
+    page_table->cpu_addr = dma_zalloc_coherent(device, VINTAGE2D_PAGE_SIZE,
                                                &page_table->dma_addr,
                                                GFP_KERNEL);
     if (IS_ERR_OR_NULL(page_table->cpu_addr)) {
@@ -374,7 +379,7 @@ int alloc_memory_for_canvas(uint16_t canvas_width, uint16_t canvas_height,
     }
     num_of_pages_to_alloc = DIV_ROUND_UP(canvas_size, VINTAGE2D_PAGE_SIZE);
     canvas_page_info->pages =
-            (vintage_page_t *) kzalloc(num_of_pages_to_alloc * sizeof(vintage_page_t),
+            (vintage_mem_t *) kzalloc(num_of_pages_to_alloc * sizeof(vintage_mem_t),
                                        GFP_KERNEL);
     page_entry_addr = (unsigned long *) page_table->cpu_addr;
     for (i = 0; i < num_of_pages_to_alloc; ++i) {
@@ -438,7 +443,7 @@ int vintage_mmap(struct file *file, struct vm_area_struct *vma)
 {
     unsigned long i, num_of_mmaped_pages, num_of_allocated_pages, offset;
     dev_context_info_t *dev_context;
-    vintage_page_t *pages;
+    vintage_mem_t *pages;
     printk(KERN_WARNING "MMAP\n");
     dev_context = (dev_context_info_t *) file->private_data;
     if (!dev_context->was_ioctl) {
@@ -475,6 +480,10 @@ int vintage_open(struct inode *inode, struct file *file)
     }
     minor = iminor(inode);
     dev_info = get_dev_info_by_minor(minor);
+    if (dev_info == NULL) {
+        printk(KERN_WARNING "Device with minor number %d not found\n", minor);
+        return -EAGAIN;
+    }
     dev_context_info->pci_dev_info = dev_info;
     file->private_data = (void *) dev_context_info;
     return 0;
@@ -497,7 +506,6 @@ int vintage_release(struct inode *inode, struct file *file)
 int vintage_fsync(struct file *file, loff_t offset1, loff_t offset2,
                   int datasync)
 {
-    mdelay(2000);
     return 0;
 }
 
@@ -507,7 +515,7 @@ irqreturn_t irq_handler(int irq, void *dev)
     pci_dev_info_t *dev_info = (pci_dev_info_t *) dev;
     interrupt = ioread32(dev_info->iomem + VINTAGE2D_INTR);
     if (interrupt & VINTAGE2D_INTR_NOTIFY) {
-        printk(KERN_WARNING "INTERRUPT: notify");
+        printk(KERN_DEBUG "INTERRUPT: notify");
     }
     if (interrupt & VINTAGE2D_INTR_INVALID_CMD) {
         printk(KERN_WARNING "INTERRUPT: invalid_cmd");
@@ -528,14 +536,16 @@ irqreturn_t irq_handler(int irq, void *dev)
 void start_device(pci_dev_info_t *dev_info)
 {
     /* Reset device */
+    iowrite32(VINTAGE2D_RESET_DRAW | VINTAGE2D_RESET_FIFO | VINTAGE2D_RESET_TLB,
+              pci_dev_info->iomem + VINTAGE2D_RESET);
+    /* Reset interrupts */
     iowrite32(VINTAGE2D_INTR_NOTIFY | VINTAGE2D_INTR_INVALID_CMD |
               VINTAGE2D_INTR_PAGE_FAULT | VINTAGE2D_INTR_CANVAS_OVERFLOW |
               VINTAGE2D_INTR_FIFO_OVERFLOW,
               pci_dev_info->iomem + VINTAGE2D_INTR);
     //iowrite32(0x0, pci_dev_info->iomem + VINTAGE2D_CMD_READ_PTR);
     //iowrite32(0x0, pci_dev_info->iomem + VINTAGE2D_CMD_WRITE_PTR);
-    iowrite32(VINTAGE2D_RESET_DRAW | VINTAGE2D_RESET_FIFO | VINTAGE2D_RESET_TLB,
-              pci_dev_info->iomem + VINTAGE2D_RESET);
+
     /* Enable interrupts */
     iowrite32(VINTAGE2D_INTR_NOTIFY | VINTAGE2D_INTR_INVALID_CMD |
               VINTAGE2D_INTR_PAGE_FAULT | VINTAGE2D_INTR_CANVAS_OVERFLOW |
@@ -552,6 +562,8 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
     struct device *device;
     pci_dev_info_t *pci_dev_info;
     void __iomem *iomem;
+    void *cpu_addr;
+    dma_addr_t dma_addr;
     int ret;
 
     printk(KERN_WARNING "Vintage probe\n");
@@ -621,32 +633,44 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
     ret = pci_set_dma_mask(dev, DMA_BIT_MASK(32));
     if (ret < 0) {
         printk(KERN_ERR "Failed to set DMA mask\n");
-        goto set_dma_mask_or_enable_device_failed;
+        goto setup_dma_failed;
     }
     ret = pci_set_consistent_dma_mask(dev, DMA_BIT_MASK(32));
     if (ret < 0) {
         printk(KERN_ERR "Failed to set consistent DMA mask\n");
-        goto set_dma_mask_or_enable_device_failed;
+        goto setup_dma_failed;
+    }
+
+    /* Allocate memory for command buffer */
+    cpu_addr = dma_zalloc_coherent(&dev->dev, COMMAND_BUF_SIZE, &dma_addr,
+                                   GFP_KERNEL);
+    if (IS_ERR_OR_NULL(cpu_addr)) {
+        printk(KERN_ERR "Failed to allocate memory for device's command buffer\n");
+        ret = -ENOMEM;
+        goto setup_dma_failed;
     }
 
     ret = pci_enable_device(dev);
     if (ret < 0) {
         printk(KERN_ERR "Failed to enable device\n");
-        goto set_dma_mask_or_enable_device_failed;
+        goto enable_device_failed;
     }
 
     /* Device successfully added */
     pci_dev_info->pci_dev = dev;
     pci_dev_info->char_dev = char_dev;
     pci_dev_info->iomem = iomem;
-    // FIXME: remove it
-    printk(KERN_DEBUG "IOMEM: %p\n", iomem);
-    /* Reset device */
+    pci_dev_info->command_buf.cpu_addr = cpu_addr;
+    pci_dev_info->command_buf.dma_addr = dma_addr;
+    sema_init(&pci_dev_info->sem, 1);
+    /* Start device */
     start_device(pci_dev_info);
 
     return 0;
 
-set_dma_mask_or_enable_device_failed:
+enable_device_failed:
+    dma_free_coherent(&dev->dev, COMMAND_BUF_SIZE, cpu_addr, dma_addr);
+setup_dma_failed:
     pci_clear_master(dev);
     free_irq(dev->irq, (void *) pci_dev_info);
 request_irq_failed:
@@ -664,10 +688,15 @@ void remove_device(pci_dev_info_t *pci_dev_info)
 {
     if (pci_dev_info->pci_dev != NULL) {
         printk(KERN_DEBUG "Removing device\n");
-        /* Disable device */
+        /* Disable interrupts, draw and fetching commands */
         iowrite32(0x0, pci_dev_info->iomem + VINTAGE2D_INTR_ENABLE);
         iowrite32(0x0, pci_dev_info->iomem + VINTAGE2D_ENABLE);
         pci_disable_device(pci_dev_info->pci_dev);
+        dma_free_coherent(&pci_dev_info->pci_dev->dev, COMMAND_BUF_SIZE,
+                          pci_dev_info->command_buf.cpu_addr,
+                          pci_dev_info->command_buf.dma_addr);
+        pci_dev_info->command_buf.cpu_addr = NULL;
+        pci_dev_info->command_buf.dma_addr = 0;
         pci_clear_master(pci_dev_info->pci_dev);
         free_irq(pci_dev_info->pci_dev->irq, (void *) pci_dev_info);
         pci_iounmap(pci_dev_info->pci_dev, pci_dev_info->iomem);
@@ -685,7 +714,7 @@ void remove_device(pci_dev_info_t *pci_dev_info)
 static void vintage_remove(struct pci_dev *dev)
 {
     pci_dev_info_t *pci_dev_info;
-    printk(KERN_WARNING "vintage remove\n");
+    printk(KERN_WARNING "Vintage remove\n");
 
     pci_dev_info = get_dev_info(dev);
     if (pci_dev_info == NULL) {
