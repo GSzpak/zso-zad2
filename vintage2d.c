@@ -24,19 +24,20 @@ MODULE_LICENSE("GPL");
 
 /******************** Defines ****************************/
 
-#define MAX_NUM_OF_DEVICES      256
-#define DRIVER_NAME             "vintage2d-pci"
-#define DEVICE_CLASS_NAME       "graphic"
-#define MMIO_SIZE               4096
-#define COMMAND_BUF_SIZE        65536
-#define COMMAND_SIZE            4
-#define MAX_WIDTH               2048
-#define MAX_HEIGHT              2048
-#define MIN_WIDTH               1
-#define MIN_HEIGHT              1
+#define MAX_NUM_OF_DEVICES                  256
+#define DRIVER_NAME                         "vintage2d-pci"
+#define DEVICE_CLASS_NAME                   "graphic"
+#define MMIO_SIZE                           4096
+#define COMMAND_BUF_SIZE                    65536
+#define COMMAND_SIZE                        4
+#define MAX_WIDTH                           2048
+#define MAX_HEIGHT                          2048
+#define MIN_WIDTH                           1
+#define MIN_HEIGHT                          1
 #define REQUIRED_POS_CMD_BITS_ZERO(cmd)     (((cmd) & (1 << 19 | 1 << 31)) == 0)
 #define REQUIRED_FILL_COLOR_BITS_ZERO(cmd)  (((cmd) & 0xffff0000) == 0)
 #define REQUIRED_DRAW_CMD_BITS_ZERO(cmd)    (((cmd) & (1 << 19 | 1 << 31)) == 0)
+#define JUMP_TO(addr)                       ((0xfffffffc & addr) | VINTAGE2D_CMD_KIND_JUMP)
 
 /******************** Typedefs ****************************/
 
@@ -44,17 +45,6 @@ typedef struct {
     void *cpu_addr;
     dma_addr_t dma_addr;
 } vintage_mem_t;
-
-typedef struct {
-    int device_number;
-    unsigned int minor;
-    dev_t dev_number;
-    struct pci_dev *pci_dev;
-    struct cdev *char_dev;
-    void __iomem *iomem;
-    vintage_mem_t command_buf;
-    struct semaphore sem;
-} pci_dev_info_t;
 
 typedef struct {
     vintage_mem_t page_table;
@@ -67,6 +57,17 @@ typedef struct {
     long last_dst_pos;
     long last_fill_color;
 } command_info_t;
+
+typedef struct {
+    int device_number;
+    unsigned int minor;
+    dev_t dev_number;
+    struct pci_dev *pci_dev;
+    struct cdev *char_dev;
+    void __iomem *iomem;
+    vintage_mem_t command_buf;
+    struct semaphore sem;
+} pci_dev_info_t;
 
 typedef struct {
     pci_dev_info_t *pci_dev_info;
@@ -170,9 +171,9 @@ pci_dev_info_t *get_dev_info_by_minor(int minor) {
 /******************** Write ****************************/
 
 // TODO: remove
-void send_cmd(long cmd, dev_context_info_t *dev_context)
+void send_to_dev(long val, pci_dev_info_t *dev_info, long reg)
 {
-    iowrite32(cmd, dev_context->pci_dev_info->iomem + VINTAGE2D_FIFO_SEND);
+    iowrite32(val, dev_info->iomem + reg);
 }
 
 int check_pos_cmd(long cmd, long x, long y, dev_context_info_t *dev_context)
@@ -296,6 +297,7 @@ ssize_t vintage_write(struct file *file, const char *buffer,
     }
     bytes_sent = 0;
     down(&dev_info->sem);
+    // TODO: Check context
     /* Reset TLB */
     iowrite32(VINTAGE2D_RESET_TLB, pci_dev_info->iomem + VINTAGE2D_RESET);
     while (bytes_sent < size) {
@@ -544,34 +546,41 @@ irqreturn_t irq_handler(int irq, void *dev)
     if (interrupt & VINTAGE2D_INTR_FIFO_OVERFLOW) {
         printk(KERN_WARNING "INTERRUPT: fifo overflow");
     }
-    iowrite32(interrupt, dev_info->iomem + VINTAGE2D_INTR);
+    send_to_dev(interrupt, dev_info, VINTAGE2D_INTR);
     return IRQ_HANDLED;
 }
 
 void start_device(pci_dev_info_t *dev_info)
 {
     /* Reset device */
-    iowrite32(VINTAGE2D_RESET_DRAW | VINTAGE2D_RESET_FIFO | VINTAGE2D_RESET_TLB,
-              pci_dev_info->iomem + VINTAGE2D_RESET);
+    send_to_dev(VINTAGE2D_RESET_DRAW | VINTAGE2D_RESET_FIFO | VINTAGE2D_RESET_TLB,
+                pci_dev_info, VINTAGE2D_RESET);
     /* Reset interrupts */
-    iowrite32(VINTAGE2D_INTR_NOTIFY | VINTAGE2D_INTR_INVALID_CMD |
-              VINTAGE2D_INTR_PAGE_FAULT | VINTAGE2D_INTR_CANVAS_OVERFLOW |
-              VINTAGE2D_INTR_FIFO_OVERFLOW,
-              pci_dev_info->iomem + VINTAGE2D_INTR);
-    /* Initialize CMD_READ_PTR and CMD_WRITE_PTR */
-    iowrite32(pci_dev_info->command_buf.dma_addr,
-              pci_dev_info->iomem + VINTAGE2D_CMD_READ_PTR);
-    iowrite32(pci_dev_info->command_buf.dma_addr,
-              pci_dev_info->iomem + VINTAGE2D_CMD_WRITE_PTR);
+    send_to_dev(VINTAGE2D_INTR_NOTIFY | VINTAGE2D_INTR_INVALID_CMD |
+                VINTAGE2D_INTR_PAGE_FAULT | VINTAGE2D_INTR_CANVAS_OVERFLOW |
+                VINTAGE2D_INTR_FIFO_OVERFLOW,
+                pci_dev_info, VINTAGE2D_INTR);
     /* Enable interrupts */
-    iowrite32(VINTAGE2D_INTR_NOTIFY | VINTAGE2D_INTR_INVALID_CMD |
-              VINTAGE2D_INTR_PAGE_FAULT | VINTAGE2D_INTR_CANVAS_OVERFLOW |
-              VINTAGE2D_INTR_FIFO_OVERFLOW,
-              pci_dev_info->iomem + VINTAGE2D_INTR_ENABLE);
+    send_to_dev(VINTAGE2D_INTR_NOTIFY | VINTAGE2D_INTR_INVALID_CMD |
+                VINTAGE2D_INTR_PAGE_FAULT | VINTAGE2D_INTR_CANVAS_OVERFLOW |
+                VINTAGE2D_INTR_FIFO_OVERFLOW,
+                pci_dev_info, VINTAGE2D_INTR_ENABLE);
     /* Enable drawing and fetching commands */
-    iowrite32(VINTAGE2D_ENABLE_DRAW | VINTAGE2D_ENABLE_FETCH_CMD,
-              pci_dev_info->iomem + VINTAGE2D_ENABLE);
-    // TODO: disable before release
+    send_to_dev(VINTAGE2D_ENABLE_DRAW | VINTAGE2D_ENABLE_FETCH_CMD,
+                pci_dev_info, VINTAGE2D_ENABLE);
+}
+
+int init_command_buffer(pci_dev_info_t *pci_dev_info)
+{
+    long *last_command;
+    int commands_in_buf = COMMAND_BUF_SIZE / COMMAND_SIZE;
+    last_command = (long *) pci_dev_info->command_buf.cpu_addr + commands_in_buf - 1;
+    *last_command = JUMP_TO(pci_dev_info->command_buf.dma_addr);
+    /* Initialize CMD_READ_PTR and CMD_WRITE_PTR */
+    send_to_dev(pci_dev_info->command_buf.dma_addr,
+                pci_dev_info, VINTAGE2D_CMD_READ_PTR);
+    send_to_dev(pci_dev_info->command_buf.dma_addr,
+                pci_dev_info, VINTAGE2D_CMD_WRITE_PTR);
 }
 
 static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
@@ -680,8 +689,9 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
     pci_dev_info->iomem = iomem;
     pci_dev_info->command_buf.cpu_addr = cpu_addr;
     pci_dev_info->command_buf.dma_addr = dma_addr;
+    init_command_buffer(pci_dev_info);
     sema_init(&pci_dev_info->sem, 1);
-    /* Start device */
+    init_command_buffer(pci_dev_info);
     start_device(pci_dev_info);
 
     return 0;
@@ -707,8 +717,8 @@ void remove_device(pci_dev_info_t *pci_dev_info)
     if (pci_dev_info->pci_dev != NULL) {
         printk(KERN_DEBUG "Removing device\n");
         /* Disable interrupts, draw and fetching commands */
-        iowrite32(0x0, pci_dev_info->iomem + VINTAGE2D_INTR_ENABLE);
-        iowrite32(0x0, pci_dev_info->iomem + VINTAGE2D_ENABLE);
+        send_to_dev(0x0, pci_dev_info, VINTAGE2D_INTR_ENABLE);
+        send_to_dev(0x0, pci_dev_info, VINTAGE2D_ENABLE);
         pci_disable_device(pci_dev_info->pci_dev);
         dma_free_coherent(&pci_dev_info->pci_dev->dev, COMMAND_BUF_SIZE,
                           pci_dev_info->command_buf.cpu_addr,
