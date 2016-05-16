@@ -169,6 +169,7 @@ pci_dev_info_t *get_dev_info_by_minor(int minor) {
 
 /******************** Write ****************************/
 
+// TODO: remove
 void send_cmd(long cmd, dev_context_info_t *dev_context)
 {
     iowrite32(cmd, dev_context->pci_dev_info->iomem + VINTAGE2D_FIFO_SEND);
@@ -188,7 +189,8 @@ int check_pos_cmd(long cmd, long x, long y, dev_context_info_t *dev_context)
     return 0;
 }
 
-int handle_src_pos_cmd(long cmd, dev_context_info_t *dev_context)
+long get_vintage_src_pos_cmd(long cmd, dev_context_info_t *dev_context,
+                             int notify)
 {
     long pos_x, pos_y;
     pos_x = V2D_CMD_POS_X(cmd);
@@ -197,12 +199,12 @@ int handle_src_pos_cmd(long cmd, dev_context_info_t *dev_context)
         printk(KERN_DEBUG "Check_pos failed");
         return -1;
     }
-    send_cmd(VINTAGE2D_CMD_SRC_POS(pos_x, pos_y, 1), dev_context);
     dev_context->command_info.last_src_pos = cmd;
-    return 0;
+    return VINTAGE2D_CMD_SRC_POS(pos_x, pos_y, notify);
 }
 
-int handle_dst_pos_cmd(long cmd, dev_context_info_t *dev_context)
+long get_vintage_dst_pos_cmd(long cmd, dev_context_info_t *dev_context,
+                             int notify)
 {
     long pos_x, pos_y;
     pos_x = V2D_CMD_POS_X(cmd);
@@ -210,12 +212,12 @@ int handle_dst_pos_cmd(long cmd, dev_context_info_t *dev_context)
     if (check_pos_cmd(cmd, pos_x, pos_y, dev_context) < 0) {
         return -1;
     }
-    send_cmd(VINTAGE2D_CMD_DST_POS(pos_x, pos_y, 1), dev_context);
     dev_context->command_info.last_dst_pos = cmd;
-    return 0;
+    return VINTAGE2D_CMD_DST_POS(pos_x, pos_y, noftify);
 }
 
-int handle_fill_color_cmd(long cmd, dev_context_info_t *dev_context)
+long get_vintage_fill_color_cmd(long cmd, dev_context_info_t *dev_context,
+                                int notify)
 {
     long color;
     printk(KERN_DEBUG "color %p", cmd);
@@ -224,12 +226,12 @@ int handle_fill_color_cmd(long cmd, dev_context_info_t *dev_context)
         return -1;
     }
     color = VINTAGE2D_CMD_COLOR(cmd);
-    send_cmd(VINTAGE2D_CMD_FILL_COLOR(color, 1), dev_context);
     dev_context->command_info.last_fill_color = cmd;
-    return 0;
+    return send_cmd(VINTAGE2D_CMD_FILL_COLOR(color, notify);
 }
 
-int handle_do_blit_cmd(long cmd, dev_context_info_t * dev_context)
+long get_vintage_do_blit_cmd(long cmd, dev_context_info_t * dev_context,
+                             int notify)
 {
     long src_pos_x, src_pos_y, dst_pos_x, dst_pos_y, width, height;
     if (!REQUIRED_DRAW_CMD_BITS_ZERO(cmd) ||
@@ -251,13 +253,12 @@ int handle_do_blit_cmd(long cmd, dev_context_info_t * dev_context)
             dst_pos_y + height > dev_context->canvas_height) {
         return -1;
     }
-    send_cmd(VINTAGE2D_CMD_DO_BLIT(width, height, 1), dev_context);
-    dev_context->command_info.last_src_pos = 0;
-    dev_context->command_info.last_dst_pos = 0;
-    return 0;
+    // TODO: Zero last src, last dst
+    return VINTAGE2D_CMD_DO_BLIT(width, height, notify);
 }
 
-int handle_do_fill_cmd(long cmd, dev_context_info_t * dev_context)
+long get_vintage_do_fill_cmd(long cmd, dev_context_info_t * dev_context,
+                             int notify)
 {
     long dst_pos_x, dst_pos_y, width, height;
     if (!REQUIRED_DRAW_CMD_BITS_ZERO(cmd) ||
@@ -273,23 +274,32 @@ int handle_do_fill_cmd(long cmd, dev_context_info_t * dev_context)
             dst_pos_y + height > dev_context->canvas_height) {
         return -1;
     }
-    send_cmd(VINTAGE2D_CMD_DO_FILL(width, height, 1), dev_context);
-    dev_context->command_info.last_src_pos = 0;
-    dev_context->command_info.last_dst_pos = 0;
-    return 0;
+    return VINTAGE2D_CMD_DO_FILL(width, height, notify);
+    // TODO: Zero last src, last dst
 }
 
-ssize_t vintage_write(struct file *file, const char __user *buffer,
+ssize_t vintage_write(struct file *file, const char *buffer,
                       size_t size, loff_t *offset)
 {
     long current_command, i;
+    size_t bytes_sent, bytes_to_copy, elems_in_buffer;
     dev_context_info_t *dev_context;
-    int (*handle_cmd_function) (long, dev_context_info_t *);
+    pci_dev_info_t *dev_info;
+    long (*get_vintage_cmd_function) (long, dev_context_info_t *, int);
 
     dev_context = (dev_context_info_t *) file->private_data;
+    dev_info = dev_context->pci_dev_info;
+    down(&dev_context->sem);
     if (!dev_context->was_ioctl || size % COMMAND_SIZE != 0) {
         printk(KERN_DEBUG "invalid command\n");
         return -EINVAL;
+    }
+    bytes_sent = 0;
+    down(&dev_info->sem);
+    /* Reset TLB */
+    iowrite32(VINTAGE2D_RESET_TLB, pci_dev_info->iomem + VINTAGE2D_RESET);
+    while (bytes_sent < size) {
+
     }
     send_cmd(VINTAGE2D_CMD_CANVAS_PT(dev_context->canvas_page_info.page_table.dma_addr, 1),
              dev_context);
@@ -304,33 +314,34 @@ ssize_t vintage_write(struct file *file, const char __user *buffer,
         switch (V2D_CMD_TYPE(current_command)) {
             case VINTAGE2D_CMD_TYPE_SRC_POS:
                 printk(KERN_DEBUG "src pos\n");
-                handle_cmd_function = handle_src_pos_cmd;
+                get_vintage_cmd_function = get_vintage_src_pos_cmd;
                 break;
             case V2D_CMD_TYPE_DST_POS:
                 printk(KERN_DEBUG "dst pos\n");
-                handle_cmd_function = handle_dst_pos_cmd;
+                get_vintage_cmd_function = get_vintage_dst_pos_cmd;
                 break;
             case V2D_CMD_TYPE_FILL_COLOR:
                 printk(KERN_DEBUG "fill\n");
-                handle_cmd_function = handle_fill_color_cmd;
+                get_vintage_cmd_function = get_vintage_fill_color_cmd;
                 break;
             case V2D_CMD_TYPE_DO_BLIT:
                 printk(KERN_DEBUG "do blit\n");
-                handle_cmd_function = handle_do_blit_cmd;
+                get_vintage_cmd_function = get_vintage_do_blit_cmd;
                 break;
             case V2D_CMD_TYPE_DO_FILL:
                 printk(KERN_DEBUG "do fill\n");
-                handle_cmd_function = handle_do_fill_cmd;
+                get_vintage_cmd_function = get_vintage_do_fill_cmd;
                 break;
             default:
                 return -EINVAL;
         }
-        if (handle_cmd_function(current_command, dev_context) < 0) {
+        if (get_vintage_cmd_function(current_command, dev_context) < 0) {
             printk(KERN_DEBUG "Invalid command\n");
             return -EINVAL;
         }
     }
     printk(KERN_DEBUG "Success %d\n", i);
+    up(&dev_context->sem);
     return i;
 }
 
@@ -375,7 +386,7 @@ int alloc_memory_for_canvas(uint16_t canvas_width, uint16_t canvas_height,
                                                GFP_KERNEL);
     if (IS_ERR_OR_NULL(page_table->cpu_addr)) {
         printk(KERN_ERR "Failed to allocate memory for device's page table\n");
-        return -ENOMEM;
+        return -1;
     }
     num_of_pages_to_alloc = DIV_ROUND_UP(canvas_size, VINTAGE2D_PAGE_SIZE);
     canvas_page_info->pages =
@@ -390,7 +401,7 @@ int alloc_memory_for_canvas(uint16_t canvas_width, uint16_t canvas_height,
         if (IS_ERR_OR_NULL(current_page->cpu_addr)) {
             printk(KERN_ERR "Failed to allocate memory for device's page\n");
             cleanup_canvas_pages(device, canvas_page_info, i);
-            return -ENOMEM;
+            return -1;
         }
         // TODO: Remove check and '& PAGE_MASK'
         WARN_ON((current_page->dma_addr & PAGE_MASK) != current_page->dma_addr);
@@ -407,12 +418,14 @@ long vintage_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     struct v2d_ioctl_set_dimensions dimensions;
     dev_context_info_t *dev_context;
-    long ret;
+
     printk(KERN_WARNING "IOCTL\n");
+
     if (cmd != V2D_IOCTL_SET_DIMENSIONS) {
         return -ENOTTY;
     }
     dev_context = (dev_context_info_t *) file->private_data;
+    down(&dev_context->sem);
     if (dev_context->was_ioctl) {
         return -EINVAL;
     }
@@ -427,15 +440,13 @@ long vintage_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             dimensions.height > MAX_HEIGHT) {
         return -EINVAL;
     }
-    ret = alloc_memory_for_canvas(dimensions.width, dimensions.height,
-                                  dev_context);
-    if (ret < 0) {
-        return ret;
+    if (alloc_memory_for_canvas(dimensions.width, dimensions.height,
+                                dev_context) < 0) {
+        return -ENOMEM;
     }
     /* ioctl successful */
     dev_context->was_ioctl = 1;
-    /* Enable drawing and fetching commands */
-    iowrite32(VINTAGE2D_ENABLE_DRAW, pci_dev_info->iomem + VINTAGE2D_ENABLE);
+    up(&dev_context->sem);
     return 0;
 }
 
@@ -446,16 +457,18 @@ int vintage_mmap(struct file *file, struct vm_area_struct *vma)
     vintage_mem_t *pages;
     printk(KERN_WARNING "MMAP\n");
     dev_context = (dev_context_info_t *) file->private_data;
+    down(&dev_context->sem);
     if (!dev_context->was_ioctl) {
         return -EINVAL;
     }
+    up(&dev_context->sem);
     num_of_allocated_pages = dev_context->canvas_page_info.num_of_pages;
     pages = dev_context->canvas_page_info.pages;
     num_of_mmaped_pages = (vma->vm_end - vma->vm_start) / VINTAGE2D_PAGE_SIZE;
     if (num_of_mmaped_pages > num_of_allocated_pages) {
         return -EINVAL;
     }
-    for (i = 0; i < num_of_allocated_pages; ++i) {
+    for (i = 0; i < num_of_mmaped_pages; ++i) {
         offset = i * VINTAGE2D_PAGE_SIZE;
         if (remap_pfn_range(vma, vma->vm_start + offset,
                             __pa(pages[i].cpu_addr) >> PAGE_SHIFT,
@@ -470,11 +483,11 @@ int vintage_mmap(struct file *file, struct vm_area_struct *vma)
 int vintage_open(struct inode *inode, struct file *file)
 {
     pci_dev_info_t *dev_info;
-    dev_context_info_t *dev_context_info;
+    dev_context_info_t *dev_context;
     int minor;
 
-    dev_context_info = kzalloc(sizeof(dev_context_info_t), GFP_KERNEL);
-    if (IS_ERR_OR_NULL(dev_context_info)) {
+    dev_context = kzalloc(sizeof(dev_context_info_t), GFP_KERNEL);
+    if (IS_ERR_OR_NULL(dev_context)) {
         printk(KERN_ERR "Failed to allocate memory\n");
         return -ENOMEM;
     }
@@ -484,20 +497,22 @@ int vintage_open(struct inode *inode, struct file *file)
         printk(KERN_WARNING "Device with minor number %d not found\n", minor);
         return -EAGAIN;
     }
-    dev_context_info->pci_dev_info = dev_info;
-    file->private_data = (void *) dev_context_info;
+    dev_context->pci_dev_info = dev_info;
+    sema_init(&dev_context->sem, 1);
+    file->private_data = (void *) dev_context;
     return 0;
 }
 
 int vintage_release(struct inode *inode, struct file *file)
 {
-    dev_context_info_t *dev_context_info;
-
-    dev_context_info = (dev_context_info_t *) file->private_data;
-    if (dev_context_info->was_ioctl) {
-        cleanup_canvas_pages(&dev_context_info->pci_dev_info->pci_dev->dev,
-                             &dev_context_info->canvas_page_info,
-                             dev_context_info->canvas_page_info.num_of_pages);
+    dev_context_info_t *dev_context;
+    /* Called always only once, no synchronization needed */
+    // TODO: Are you sure?
+    dev_context = (dev_context_info_t *) file->private_data;
+    if (dev_context->was_ioctl) {
+        cleanup_canvas_pages(&dev_context->pci_dev_info->pci_dev->dev,
+                             &dev_context->canvas_page_info,
+                             dev_context->canvas_page_info.num_of_pages);
     }
     kfree(file->private_data);
     return 0;
@@ -543,16 +558,19 @@ void start_device(pci_dev_info_t *dev_info)
               VINTAGE2D_INTR_PAGE_FAULT | VINTAGE2D_INTR_CANVAS_OVERFLOW |
               VINTAGE2D_INTR_FIFO_OVERFLOW,
               pci_dev_info->iomem + VINTAGE2D_INTR);
-    //iowrite32(0x0, pci_dev_info->iomem + VINTAGE2D_CMD_READ_PTR);
-    //iowrite32(0x0, pci_dev_info->iomem + VINTAGE2D_CMD_WRITE_PTR);
-
+    /* Initialize CMD_READ_PTR and CMD_WRITE_PTR */
+    iowrite32(pci_dev_info->command_buf.dma_addr,
+              pci_dev_info->iomem + VINTAGE2D_CMD_READ_PTR);
+    iowrite32(pci_dev_info->command_buf.dma_addr,
+              pci_dev_info->iomem + VINTAGE2D_CMD_WRITE_PTR);
     /* Enable interrupts */
     iowrite32(VINTAGE2D_INTR_NOTIFY | VINTAGE2D_INTR_INVALID_CMD |
               VINTAGE2D_INTR_PAGE_FAULT | VINTAGE2D_INTR_CANVAS_OVERFLOW |
               VINTAGE2D_INTR_FIFO_OVERFLOW,
               pci_dev_info->iomem + VINTAGE2D_INTR_ENABLE);
     /* Enable drawing and fetching commands */
-    //iowrite32(VINTAGE2D_ENABLE_DRAW, pci_dev_info->iomem + VINTAGE2D_ENABLE);
+    iowrite32(VINTAGE2D_ENABLE_DRAW | VINTAGE2D_ENABLE_FETCH_CMD,
+              pci_dev_info->iomem + VINTAGE2D_ENABLE);
     // TODO: disable before release
 }
 
@@ -724,7 +742,6 @@ static void vintage_remove(struct pci_dev *dev)
         remove_device(pci_dev_info);
     }
 }
-
 
 static int vintage_init_module(void)
 {
