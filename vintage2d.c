@@ -7,20 +7,16 @@
 #include <linux/irqreturn.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
-#include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mm.h>
-#include <linux/mutex.h>
 #include <linux/io.h>
 #include <linux/pci.h>
+#include <linux/sched.h>
 #include <linux/semaphore.h>
 #include <linux/slab.h>
 #include <linux/wait.h>
 #include "vintage2d.h"
 #include "v2d_ioctl.h"
-
-// TODO: remove delay.h
-MODULE_LICENSE("GPL");
 
 /******************** Defines ****************************/
 
@@ -29,7 +25,7 @@ MODULE_LICENSE("GPL");
 #define DEVICE_CLASS_NAME                   "graphic"
 #define MMIO_SIZE                           4096
 #define COMMAND_BUF_SIZE                    65536
-#define COMMAND_SIZE                        4
+#define COMMAND_SIZE                        sizeof(long)
 /* Last 4 bytes are reserved for JUMP command */
 #define REAL_BUF_SIZE                       (COMMAND_BUF_SIZE - COMMAND_SIZE)
 #define MAX_WIDTH                           2048
@@ -38,6 +34,8 @@ MODULE_LICENSE("GPL");
 #define MIN_HEIGHT                          1
 /* Buffer size for SRC_POS / DST_POS / FILL_COLOR commands */
 #define HIS_BUF_SIZE                        2
+#define COUNTER_FLAG_SET                    1
+#define COUNTER_FLAG_UNSET                  0
 #define REQUIRED_POS_CMD_BITS_ZERO(cmd)     (((cmd) & (1 << 19 | 1 << 31)) == 0)
 #define REQUIRED_FILL_COLOR_BITS_ZERO(cmd)  (((cmd) & 0xffff0000) == 0)
 #define REQUIRED_DRAW_CMD_BITS_ZERO(cmd)    (((cmd) & (1 << 19 | 1 << 31)) == 0)
@@ -92,7 +90,6 @@ struct dev_context_info {
     struct semaphore sem;
 };
 
-
 /******************** Function declarations ****************************/
 
 static int vintage_probe(struct pci_dev *, const struct pci_device_id *);
@@ -105,6 +102,8 @@ int vintage_release(struct inode *, struct file *);
 int vintage_fsync(struct file *, loff_t, loff_t, int);
 
 /******************** Global vaiables ****************************/
+
+MODULE_LICENSE("GPL");
 
 static struct pci_device_id pci_ids[] = {
     { PCI_DEVICE(VINTAGE2D_VENDOR_ID, VINTAGE2D_DEVICE_ID), },
@@ -204,7 +203,7 @@ unsigned int read_from_dev(pci_dev_info_t *dev_info, long reg)
     return ioread32(dev_info->iomem + reg);
 }
 
-void do_sync()
+void do_sync(void)
 {
 
 }
@@ -253,8 +252,8 @@ void change_context(pci_dev_info_t *dev_info, dev_context_info_t *context)
 
 int check_pos_cmd(long cmd, long x, long y, dev_context_info_t *dev_context)
 {
-    printk(KERN_DEBUG "Check pos: x %d, y %d, width %d, height %d\n", x, y,
-           dev_context->canvas_width, dev_context->canvas_height);
+    //printk(KERN_DEBUG "Check pos: x %d, y %d, width %d, height %d\n", x, y,
+    //       dev_context->canvas_width, dev_context->canvas_height);
     if (!REQUIRED_POS_CMD_BITS_ZERO(cmd) ||
             x < 0 ||
             x >= dev_context->canvas_width ||
@@ -377,14 +376,18 @@ int handle_do_fill_cmd(long cmd, pci_dev_info_t *dev_info)
     add_cmd_to_buf(dev_info, VINTAGE2D_CMD_FILL_COLOR(color, 0));
     add_cmd_to_buf(dev_info, VINTAGE2D_CMD_DO_FILL(width, height, 1));
     clear_his(dev_info->current_context);
+    return 0;
 }
 
+void set_write_finished_flag(pci_dev_info_t *dev_info)
+{
+
+}
 
 ssize_t vintage_write(struct file *file, const char *buffer,
                       size_t size, loff_t *offset)
 {
     long current_command, i;
-    size_t bytes_sent, bytes_to_copy, elems_in_buffer;
     dev_context_info_t *dev_context;
     pci_dev_info_t *dev_info;
     int (*handle_cmd_function) (long, pci_dev_info_t *);
@@ -393,17 +396,15 @@ ssize_t vintage_write(struct file *file, const char *buffer,
     dev_info = dev_context->pci_dev_info;
     down(&dev_context->sem);
     if (!dev_context->was_ioctl || size % COMMAND_SIZE != 0) {
-        printk(KERN_DEBUG "invalid command\n");
         return -EINVAL;
     }
-    bytes_sent = 0;
     down(&dev_info->sem);
     if (dev_info->current_context != dev_context) {
         change_context(dev_info, dev_context);
     }
-    for (i = 0; i < size; i += sizeof(unsigned long)) {
+    for (i = 0; i < size; i += sizeof(long)) {
         if (copy_from_user(&current_command, buffer + i,
-                sizeof(unsigned long)) != 0) {
+                sizeof(long)) != 0) {
             return -EFAULT;
         }
         switch (V2D_CMD_TYPE(current_command)) {
@@ -547,7 +548,7 @@ long vintage_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 int vintage_mmap(struct file *file, struct vm_area_struct *vma)
 {
-    unsigned long i, num_of_mmaped_pages, num_of_allocated_pages, offset;
+    unsigned long i, num_of_mmaped_pages, num_of_full_mapped_pages, offset, size;
     dev_context_info_t *dev_context;
     vintage_mem_t *pages;
     printk(KERN_WARNING "MMAP\n");
@@ -556,19 +557,30 @@ int vintage_mmap(struct file *file, struct vm_area_struct *vma)
     if (!dev_context->was_ioctl) {
         return -EINVAL;
     }
-    num_of_allocated_pages = dev_context->canvas_page_info.num_of_pages;
     pages = dev_context->canvas_page_info.pages;
-    // FIXME: DIV_UP
-    num_of_mmaped_pages = (vma->vm_end - vma->vm_start) / VINTAGE2D_PAGE_SIZE;
-    if (num_of_mmaped_pages > num_of_allocated_pages) {
+    num_of_mmaped_pages = DIV_ROUND_UP((vma->vm_end - vma->vm_start),
+                                       VINTAGE2D_PAGE_SIZE);
+    if (num_of_mmaped_pages > dev_context->canvas_page_info.num_of_pages) {
         return -EINVAL;
     }
-    for (i = 0; i < num_of_mmaped_pages; ++i) {
+    num_of_full_mapped_pages = (vma->vm_end - vma->vm_start) % VINTAGE2D_PAGE_SIZE == 0 ?
+                               num_of_mmaped_pages : num_of_mmaped_pages - 1;
+    for (i = 0; i < num_of_full_mapped_pages; ++i) {
         offset = i * VINTAGE2D_PAGE_SIZE;
         if (remap_pfn_range(vma, vma->vm_start + offset,
                             __pa(pages[i].cpu_addr) >> PAGE_SHIFT,
                             VINTAGE2D_PAGE_SIZE, vma->vm_page_prot) < 0) {
-            printk(KERN_ERR "Mmap failed\n");
+            printk(KERN_ERR "vintage_mmap failed\n");
+            return -EAGAIN;
+        }
+    }
+    if (num_of_full_mapped_pages < num_of_mmaped_pages) {
+        offset = i * VINTAGE2D_PAGE_SIZE;
+        if (remap_pfn_range(vma, vma->vm_start + offset,
+                            __pa(pages[i].cpu_addr) >> PAGE_SHIFT,
+                            vma->vm_end - (vma->vm_start + offset),
+                            vma->vm_page_prot) < 0) {
+            printk(KERN_ERR "vintage_mmap failed\n");
             return -EAGAIN;
         }
     }
@@ -663,7 +675,7 @@ void start_device(pci_dev_info_t *dev_info)
                 pci_dev_info, VINTAGE2D_ENABLE);
 }
 
-int init_command_buffer(pci_dev_info_t *pci_dev_info)
+void init_command_buffer(pci_dev_info_t *pci_dev_info)
 {
     long *last_command_addr;
     last_command_addr = get_last_command_addr(&pci_dev_info->command_buf);
