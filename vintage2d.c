@@ -34,8 +34,9 @@
 #define MIN_HEIGHT                          1
 /* Buffer size for SRC_POS / DST_POS / FILL_COLOR commands */
 #define HIS_BUF_SIZE                        2
-#define COUNTER_FLAG_SET                    1
-#define COUNTER_FLAG_UNSET                  0
+/* Flags sent to COUNTER for synchronization */
+#define COUNTER_FLAG_0                      1
+#define COUNTER_FLAG_1                      0
 #define REQUIRED_POS_CMD_BITS_ZERO(cmd)     (((cmd) & (1 << 19 | 1 << 31)) == 0)
 #define REQUIRED_FILL_COLOR_BITS_ZERO(cmd)  (((cmd) & 0xffff0000) == 0)
 #define REQUIRED_DRAW_CMD_BITS_ZERO(cmd)    (((cmd) & (1 << 19 | 1 << 31)) == 0)
@@ -78,6 +79,7 @@ struct pci_dev_info {
     command_buf_t command_buf;
     struct semaphore sem;
     dev_context_info_t *current_context;
+    wait_queue_head_t wait_queue;
 };
 
 struct dev_context_info {
@@ -129,7 +131,6 @@ static dev_t dev_number;
 static unsigned int major;
 static pci_dev_info_t pci_dev_info[MAX_NUM_OF_DEVICES];
 static struct class *vintage_class;
-DECLARE_WAIT_QUEUE_HEAD(wait_queue);
 
 /******************** Definitions ****************************/
 
@@ -145,6 +146,7 @@ void reset_dev_info(pci_dev_info_t *pci_dev_info)
     pci_dev_info->command_buf.buf.dma_addr = 0;
     pci_dev_info->command_buf.cpu_write_ptr = NULL;
     pci_dev_info->command_buf.dma_write_ptr = 0;
+    pci_dev_info->current_context = NULL;
 }
 
 void init_pci_dev_info(unsigned int first_minor)
@@ -154,6 +156,8 @@ void init_pci_dev_info(unsigned int first_minor)
         pci_dev_info[i].device_number = i;
         pci_dev_info[i].minor = first_minor++;
         pci_dev_info[i].dev_number = MKDEV(major, pci_dev_info[i].minor);
+        sema_init(&pci_dev_info[i].sem, 1);
+        init_waitqueue_head(&pci_dev_info[i].wait_queue);
         reset_dev_info(pci_dev_info + i);
     }
 }
@@ -203,9 +207,13 @@ unsigned int read_from_dev(pci_dev_info_t *dev_info, long reg)
     return ioread32(dev_info->iomem + reg);
 }
 
-void do_sync(void)
+void wait_for_space(pci_dev_info_t *dev_info, unsigned int num_of_cmds)
 {
-
+    wait_event(dev_info->wait_queue,
+               ((read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR) -
+                 dev_info->command_buf.dma_write_ptr +
+                 REAL_BUF_SIZE) % REAL_BUF_SIZE ==
+                num_of_cmds * COMMAND_SIZE));
 }
 
 long *get_last_command_addr(command_buf_t *buf)
@@ -226,20 +234,27 @@ void add_cmd_to_buf(pci_dev_info_t *dev_info, long cmd)
     send_to_dev(buf->buf.dma_addr, dev_info, VINTAGE2D_CMD_WRITE_PTR);
 }
 
-void wait_for_space(pci_dev_info_t *dev_info, unsigned int num_of_cmds)
+void sync_dev(pci_dev_info_t *dev_info)
 {
-    wait_event(wait_queue,
-               ((read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR) -
-                 dev_info->command_buf.dma_write_ptr +
-                 REAL_BUF_SIZE) % REAL_BUF_SIZE ==
-                num_of_cmds * COMMAND_SIZE));
+    /* Waits for the previous context to finish its job */
+    long current_flag, next_flag;
+    current_flag = read_from_dev(dev_info, VINTAGE2D_COUNTER);
+    next_flag = current_flag == COUNTER_FLAG_0 ? COUNTER_FLAG_1 : COUNTER_FLAG_0;
+    wait_for_space(dev_info, 1);
+    add_cmd_to_buf(dev_info, VINTAGE2D_CMD_COUNTER(next_flag, 1));
+    wait_event(dev_info->wait_queue,
+               read_from_dev(dev_info, VINTAGE2D_COUNTER) == next_flag);
+    dev_info->current_context = NULL;
 }
 
 void change_context(pci_dev_info_t *dev_info, dev_context_info_t *context)
 {
-    do_sync();
+    if (dev_info->current_context != NULL) {
+        sync_dev(dev_info);
+    }
     /* Reset TLB */
     send_to_dev(VINTAGE2D_RESET_TLB, dev_info, VINTAGE2D_RESET);
+    /* Set page table */
     wait_for_space(dev_info, 2);
     add_cmd_to_buf(dev_info,
                    VINTAGE2D_CMD_CANVAS_PT(
@@ -379,33 +394,30 @@ int handle_do_fill_cmd(long cmd, pci_dev_info_t *dev_info)
     return 0;
 }
 
-void set_write_finished_flag(pci_dev_info_t *dev_info)
-{
-
-}
-
 ssize_t vintage_write(struct file *file, const char *buffer,
                       size_t size, loff_t *offset)
 {
-    long current_command, i;
+    long current_command, i, err;
     dev_context_info_t *dev_context;
     pci_dev_info_t *dev_info;
     int (*handle_cmd_function) (long, pci_dev_info_t *);
 
     dev_context = (dev_context_info_t *) file->private_data;
     dev_info = dev_context->pci_dev_info;
-    down(&dev_context->sem);
-    if (!dev_context->was_ioctl || size % COMMAND_SIZE != 0) {
-        return -EINVAL;
-    }
     down(&dev_info->sem);
+    down(&dev_context->sem);
+    if (!dev_context->was_ioctl || (size % COMMAND_SIZE) != 0) {
+        err = -EINVAL;
+        goto write_error;
+    }
     if (dev_info->current_context != dev_context) {
         change_context(dev_info, dev_context);
     }
     for (i = 0; i < size; i += sizeof(long)) {
         if (copy_from_user(&current_command, buffer + i,
                 sizeof(long)) != 0) {
-            return -EFAULT;
+            err = -EFAULT;
+            goto write_error;
         }
         switch (V2D_CMD_TYPE(current_command)) {
             case VINTAGE2D_CMD_TYPE_SRC_POS:
@@ -428,17 +440,22 @@ ssize_t vintage_write(struct file *file, const char *buffer,
                 handle_cmd_function = handle_do_fill_cmd;
                 break;
             default:
-                return -EINVAL;
+                err = -EINVAL;
+                goto write_error;
         }
         if (handle_cmd_function(current_command, dev_info) < 0) {
-            printk(KERN_WARNING "Invalid command: %ld\n", current_command);
-            return -EINVAL;
+            err = -EINVAL;
+            goto write_error;
         }
     }
     //printk(KERN_DEBUG "Success %d\n", i);
     up(&dev_info->sem);
     up(&dev_context->sem);
     return size;
+write_error:
+    up(&dev_context->sem);
+    up(&dev_info->sem);
+    return err;
 }
 
 /******************** ioctl & alloc ****************************/
@@ -523,10 +540,12 @@ long vintage_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     dev_context = (dev_context_info_t *) file->private_data;
     down(&dev_context->sem);
     if (dev_context->was_ioctl) {
+        up(&dev_context->sem);
         return -EINVAL;
     }
     if (copy_from_user((void *) &dimensions, (void *) arg,
             sizeof(struct v2d_ioctl_set_dimensions)) != 0) {
+        up(&dev_context->sem);
         printk(KERN_ERR "Copying from user space failed\n");
         return -EFAULT;
     }
@@ -534,10 +553,12 @@ long vintage_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             dimensions.width > MAX_WIDTH ||
             dimensions.height < MIN_HEIGHT ||
             dimensions.height > MAX_HEIGHT) {
+        up(&dev_context->sem);
         return -EINVAL;
     }
     if (alloc_memory_for_canvas(dimensions.width, dimensions.height,
                                 dev_context) < 0) {
+        up(&dev_context->sem);
         return -ENOMEM;
     }
     /* ioctl successful */
@@ -548,20 +569,21 @@ long vintage_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 
 int vintage_mmap(struct file *file, struct vm_area_struct *vma)
 {
-    unsigned long i, num_of_mmaped_pages, num_of_full_mapped_pages, offset, size;
+    unsigned long i, num_of_mmaped_pages, num_of_full_mapped_pages, offset;
     dev_context_info_t *dev_context;
     vintage_mem_t *pages;
+    // TODO: remove KERN_WARNING prints
     printk(KERN_WARNING "MMAP\n");
     dev_context = (dev_context_info_t *) file->private_data;
     down(&dev_context->sem);
     if (!dev_context->was_ioctl) {
-        return -EINVAL;
+        goto invalid_cmd;
     }
     pages = dev_context->canvas_page_info.pages;
     num_of_mmaped_pages = DIV_ROUND_UP((vma->vm_end - vma->vm_start),
                                        VINTAGE2D_PAGE_SIZE);
     if (num_of_mmaped_pages > dev_context->canvas_page_info.num_of_pages) {
-        return -EINVAL;
+        goto invalid_cmd;
     }
     num_of_full_mapped_pages = (vma->vm_end - vma->vm_start) % VINTAGE2D_PAGE_SIZE == 0 ?
                                num_of_mmaped_pages : num_of_mmaped_pages - 1;
@@ -570,8 +592,7 @@ int vintage_mmap(struct file *file, struct vm_area_struct *vma)
         if (remap_pfn_range(vma, vma->vm_start + offset,
                             __pa(pages[i].cpu_addr) >> PAGE_SHIFT,
                             VINTAGE2D_PAGE_SIZE, vma->vm_page_prot) < 0) {
-            printk(KERN_ERR "vintage_mmap failed\n");
-            return -EAGAIN;
+            goto remap_failed;
         }
     }
     if (num_of_full_mapped_pages < num_of_mmaped_pages) {
@@ -580,12 +601,18 @@ int vintage_mmap(struct file *file, struct vm_area_struct *vma)
                             __pa(pages[i].cpu_addr) >> PAGE_SHIFT,
                             vma->vm_end - (vma->vm_start + offset),
                             vma->vm_page_prot) < 0) {
-            printk(KERN_ERR "vintage_mmap failed\n");
-            return -EAGAIN;
+            goto remap_failed;
         }
     }
     up(&dev_context->sem);
     return 0;
+invalid_cmd:
+    up(&dev_context->sem);
+    return -EINVAL;
+remap_failed:
+    up(&dev_context->sem);
+    printk(KERN_ERR "vintage_mmap failed\n");
+    return -EAGAIN;
 }
 
 int vintage_open(struct inode *inode, struct file *file)
@@ -621,13 +648,24 @@ int vintage_release(struct inode *inode, struct file *file)
                              &dev_context->canvas_page_info,
                              dev_context->canvas_page_info.num_of_pages);
     }
-    kfree(file->private_data);
+    kfree(dev_context);
     return 0;
 }
 
 int vintage_fsync(struct file *file, loff_t offset1, loff_t offset2,
                   int datasync)
 {
+    dev_context_info_t *dev_context;
+    dev_context = (dev_context_info_t *) file->private_data;
+
+    if (!dev_context->was_ioctl) {
+        return -EINVAL;
+    }
+    down(&dev_context->pci_dev_info->sem);
+    if (dev_context->pci_dev_info->current_context == dev_context) {
+        sync_dev(dev_context->pci_dev_info);
+    }
+    up(&dev_context->pci_dev_info->sem);
     return 0;
 }
 
@@ -797,7 +835,6 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
     pci_dev_info->iomem = iomem;
     pci_dev_info->command_buf.buf.cpu_addr = cpu_addr;
     pci_dev_info->command_buf.buf.dma_addr = dma_addr;
-    sema_init(&pci_dev_info->sem, 1);
     init_command_buffer(pci_dev_info);
     start_device(pci_dev_info);
 
@@ -837,7 +874,7 @@ void remove_device(pci_dev_info_t *pci_dev_info)
         pci_iounmap(pci_dev_info->pci_dev, pci_dev_info->iomem);
         pci_release_regions(pci_dev_info->pci_dev);
         device_destroy(vintage_class, pci_dev_info->dev_number);
-
+        wake_up_all(&pci_dev_info->wait_queue);
     }
     if (pci_dev_info->char_dev != NULL) {
         cdev_del(pci_dev_info->char_dev);
