@@ -622,16 +622,16 @@ int vintage_open(struct inode *inode, struct file *file)
     dev_context_info_t *dev_context;
     int minor;
 
-    dev_context = kzalloc(sizeof(dev_context_info_t), GFP_KERNEL);
-    if (IS_ERR_OR_NULL(dev_context)) {
-        printk(KERN_ERR "Failed to allocate memory\n");
-        return -ENOMEM;
-    }
     minor = iminor(inode);
     dev_info = get_dev_info_by_minor(minor);
     if (dev_info == NULL) {
         printk(KERN_WARNING "Device with minor number %d not found\n", minor);
-        return -EAGAIN;
+        return -ENODEV;
+    }
+    dev_context = kzalloc(sizeof(dev_context_info_t), GFP_KERNEL);
+    if (IS_ERR_OR_NULL(dev_context)) {
+        printk(KERN_ERR "Failed to allocate memory\n");
+        return -ENOMEM;
     }
     dev_context->pci_dev_info = dev_info;
     mutex_init(&dev_context->mutex);
