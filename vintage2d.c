@@ -239,12 +239,13 @@ void add_cmd_to_buf(pci_dev_info_t *dev_info, long cmd)
 
 void sync_dev(pci_dev_info_t *dev_info)
 {
+    long current_flag, next_flag;
+
     /* Waits for the previous context to finish its job */
     if (dev_info->current_context == NULL) {
         /* Device already synchronized */
         return;
     }
-    long current_flag, next_flag;
     current_flag = read_from_dev(dev_info, VINTAGE2D_COUNTER);
     next_flag = current_flag == COUNTER_FLAG_0 ? COUNTER_FLAG_1 : COUNTER_FLAG_0;
     wait_for_space(dev_info, 1);
@@ -699,7 +700,7 @@ irqreturn_t irq_handler(int irq, void *dev)
     return IRQ_HANDLED;
 }
 
-void start_device(pci_dev_info_t *dev_info)
+void reset_device(pci_dev_info_t *dev_info)
 {
     /* Reset device */
     send_to_dev(VINTAGE2D_RESET_DRAW | VINTAGE2D_RESET_FIFO | VINTAGE2D_RESET_TLB,
@@ -709,6 +710,11 @@ void start_device(pci_dev_info_t *dev_info)
                 VINTAGE2D_INTR_PAGE_FAULT | VINTAGE2D_INTR_CANVAS_OVERFLOW |
                 VINTAGE2D_INTR_FIFO_OVERFLOW,
                 pci_dev_info, VINTAGE2D_INTR);
+}
+
+void start_device(pci_dev_info_t *dev_info)
+{
+    reset_device(dev_info);
     /* Enable interrupts */
     send_to_dev(VINTAGE2D_INTR_NOTIFY | VINTAGE2D_INTR_INVALID_CMD |
                 VINTAGE2D_INTR_PAGE_FAULT | VINTAGE2D_INTR_CANVAS_OVERFLOW |
@@ -862,13 +868,19 @@ device_create_failed:
     return ret;
 }
 
+void stop_device(pci_dev_info_t *dev_info)
+{
+    send_to_dev(0x0, pci_dev_info, VINTAGE2D_ENABLE);
+    send_to_dev(0x0, pci_dev_info, VINTAGE2D_INTR_ENABLE);
+    reset_device(dev_info);
+}
+
 void remove_device(pci_dev_info_t *pci_dev_info)
 {
     if (pci_dev_info->pci_dev != NULL) {
         printk(KERN_DEBUG "Removing device\n");
         /* Disable interrupts, draw and fetching commands */
-        send_to_dev(0x0, pci_dev_info, VINTAGE2D_INTR_ENABLE);
-        send_to_dev(0x0, pci_dev_info, VINTAGE2D_ENABLE);
+        stop_device(pci_dev_info);
         if (pci_is_enabled(pci_dev_info->pci_dev)) {
             pci_disable_device(pci_dev_info->pci_dev);
         }
@@ -895,8 +907,11 @@ static void vintage_remove(struct pci_dev *dev)
 
     pci_dev_info = get_dev_info(dev);
     if (pci_dev_info == NULL) {
-        printk(KERN_WARNING "Device not found in device table\n");
-        pci_disable_device(dev);
+        printk(KERN_WARNING "Vintage remove: device not found in device table - "
+                       "probably is already removed\n");
+        if (pci_is_enabled(dev)) {
+            pci_disable_device(dev);
+        }
     } else {
         remove_device(pci_dev_info);
     }
