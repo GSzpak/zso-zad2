@@ -13,7 +13,6 @@
 #include <linux/io.h>
 #include <linux/pci.h>
 #include <linux/sched.h>
-#include <linux/semaphore.h>
 #include <linux/slab.h>
 #include <linux/wait.h>
 #include "vintage2d.h"
@@ -42,6 +41,8 @@
 #define REQUIRED_FILL_COLOR_BITS_ZERO(cmd)  (((cmd) & 0xffff0000) == 0)
 #define REQUIRED_DRAW_CMD_BITS_ZERO(cmd)    (((cmd) & (1 << 19 | 1 << 31)) == 0)
 #define JUMP_TO(addr)                       ((0xfffffffc & addr) | VINTAGE2D_CMD_KIND_JUMP)
+
+MODULE_LICENSE("GPL");
 
 /******************** Typedefs ****************************/
 
@@ -78,7 +79,7 @@ struct pci_dev_info {
     struct cdev *char_dev;
     void __iomem *iomem;
     command_buf_t command_buf;
-    struct semaphore sem;
+    struct mutex mutex;
     dev_context_info_t *current_context;
     wait_queue_head_t wait_queue;
 };
@@ -90,7 +91,7 @@ struct dev_context_info {
     long canvas_height;
     long canvas_width;
     command_his_t command_his;
-    struct semaphore sem;
+    struct mutex mutex;
 };
 
 /******************** Function declarations ****************************/
@@ -106,7 +107,6 @@ int vintage_fsync(struct file *, loff_t, loff_t, int);
 
 /******************** Global vaiables ****************************/
 
-MODULE_LICENSE("GPL");
 
 static struct pci_device_id pci_ids[] = {
     { PCI_DEVICE(VINTAGE2D_VENDOR_ID, VINTAGE2D_DEVICE_ID), },
@@ -133,6 +133,8 @@ static unsigned int major;
 static pci_dev_info_t pci_dev_info[MAX_NUM_OF_DEVICES];
 static struct class *vintage_class;
 
+MODULE_DEVICE_TABLE(pci, pci_ids);
+
 /******************** Definitions ****************************/
 
 
@@ -157,7 +159,7 @@ void init_pci_dev_info(unsigned int first_minor)
         pci_dev_info[i].device_number = i;
         pci_dev_info[i].minor = first_minor++;
         pci_dev_info[i].dev_number = MKDEV(major, pci_dev_info[i].minor);
-        sema_init(&pci_dev_info[i].sem, 1);
+        mutex_init(&pci_dev_info[i].mutex);
         init_waitqueue_head(&pci_dev_info[i].wait_queue);
         reset_dev_info(pci_dev_info + i);
     }
@@ -407,8 +409,10 @@ ssize_t vintage_write(struct file *file, const char *buffer,
 
     dev_context = (dev_context_info_t *) file->private_data;
     dev_info = dev_context->pci_dev_info;
-    down(&dev_info->sem);
-    down(&dev_context->sem);
+
+    mutex_lock(&dev_info->mutex);
+    mutex_lock(&dev_context->mutex);
+
     if (!dev_context->was_ioctl || (size % COMMAND_SIZE) != 0) {
         err = -EINVAL;
         goto write_error;
@@ -452,12 +456,12 @@ ssize_t vintage_write(struct file *file, const char *buffer,
         }
     }
     //printk(KERN_DEBUG "Success %d\n", i);
-    up(&dev_context->sem);
-    up(&dev_info->sem);
+    mutex_unlock(&dev_context->mutex);
+    mutex_unlock(&dev_info->mutex);
     return size;
 write_error:
-    up(&dev_context->sem);
-    up(&dev_info->sem);
+    mutex_unlock(&dev_context->mutex);
+    mutex_unlock(&dev_info->mutex);
     return err;
 }
 
@@ -541,14 +545,14 @@ long vintage_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
         return -ENOTTY;
     }
     dev_context = (dev_context_info_t *) file->private_data;
-    down(&dev_context->sem);
+    mutex_lock(&dev_context->mutex);
     if (dev_context->was_ioctl) {
-        up(&dev_context->sem);
+        mutex_unlock(&dev_context->mutex);
         return -EINVAL;
     }
     if (copy_from_user((void *) &dimensions, (void *) arg,
             sizeof(struct v2d_ioctl_set_dimensions)) != 0) {
-        up(&dev_context->sem);
+        mutex_unlock(&dev_context->mutex);
         printk(KERN_ERR "Copying from user space failed\n");
         return -EFAULT;
     }
@@ -556,17 +560,17 @@ long vintage_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
             dimensions.width > MAX_WIDTH ||
             dimensions.height < MIN_HEIGHT ||
             dimensions.height > MAX_HEIGHT) {
-        up(&dev_context->sem);
+        mutex_unlock(&dev_context->mutex);
         return -EINVAL;
     }
     if (alloc_memory_for_canvas(dimensions.width, dimensions.height,
                                 dev_context) < 0) {
-        up(&dev_context->sem);
+        mutex_unlock(&dev_context->mutex);
         return -ENOMEM;
     }
     /* ioctl successful */
     dev_context->was_ioctl = 1;
-    up(&dev_context->sem);
+    mutex_unlock(&dev_context->mutex);
     return 0;
 }
 
@@ -629,7 +633,7 @@ int vintage_open(struct inode *inode, struct file *file)
         return -EAGAIN;
     }
     dev_context->pci_dev_info = dev_info;
-    sema_init(&dev_context->sem, 1);
+    mutex_init(&dev_context->mutex);
     file->private_data = (void *) dev_context;
     return 0;
 }
@@ -640,6 +644,7 @@ int vintage_release(struct inode *inode, struct file *file)
     /* Called always only once, no synchronization needed */
     dev_context = (dev_context_info_t *) file->private_data;
     if (dev_context->was_ioctl) {
+        // TODO: fsync
         cleanup_canvas_pages(&dev_context->pci_dev_info->pci_dev->dev,
                              &dev_context->canvas_page_info,
                              dev_context->canvas_page_info.num_of_pages);
@@ -657,11 +662,11 @@ int vintage_fsync(struct file *file, loff_t offset1, loff_t offset2,
     if (!dev_context->was_ioctl) {
         return -EINVAL;
     }
-    down(&dev_context->pci_dev_info->sem);
+    mutex_lock(&dev_context->pci_dev_info->mutex);
     if (dev_context->pci_dev_info->current_context == dev_context) {
         sync_dev(dev_context->pci_dev_info);
     }
-    up(&dev_context->pci_dev_info->sem);
+    mutex_unlock(&dev_context->pci_dev_info->mutex);
     return 0;
 }
 
