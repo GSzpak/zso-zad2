@@ -7,8 +7,9 @@
 #include <linux/irqreturn.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
-#include <linux/module.h>
 #include <linux/mm.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/io.h>
 #include <linux/pci.h>
 #include <linux/sched.h>
@@ -237,6 +238,10 @@ void add_cmd_to_buf(pci_dev_info_t *dev_info, long cmd)
 void sync_dev(pci_dev_info_t *dev_info)
 {
     /* Waits for the previous context to finish its job */
+    if (dev_info->current_context == NULL) {
+        /* Device already synchronized */
+        return;
+    }
     long current_flag, next_flag;
     current_flag = read_from_dev(dev_info, VINTAGE2D_COUNTER);
     next_flag = current_flag == COUNTER_FLAG_0 ? COUNTER_FLAG_1 : COUNTER_FLAG_0;
@@ -249,9 +254,7 @@ void sync_dev(pci_dev_info_t *dev_info)
 
 void change_context(pci_dev_info_t *dev_info, dev_context_info_t *context)
 {
-    if (dev_info->current_context != NULL) {
-        sync_dev(dev_info);
-    }
+    sync_dev(dev_info);
     /* Reset TLB */
     send_to_dev(VINTAGE2D_RESET_TLB, dev_info, VINTAGE2D_RESET);
     /* Set page table */
@@ -572,18 +575,19 @@ int vintage_mmap(struct file *file, struct vm_area_struct *vma)
     unsigned long i, num_of_mmaped_pages, num_of_full_mapped_pages, offset;
     dev_context_info_t *dev_context;
     vintage_mem_t *pages;
+
     // TODO: remove KERN_WARNING prints
     printk(KERN_WARNING "MMAP\n");
+
     dev_context = (dev_context_info_t *) file->private_data;
-    down(&dev_context->sem);
     if (!dev_context->was_ioctl) {
-        goto invalid_cmd;
+        return -EINVAL;
     }
     pages = dev_context->canvas_page_info.pages;
     num_of_mmaped_pages = DIV_ROUND_UP((vma->vm_end - vma->vm_start),
                                        VINTAGE2D_PAGE_SIZE);
     if (num_of_mmaped_pages > dev_context->canvas_page_info.num_of_pages) {
-        goto invalid_cmd;
+        return -EINVAL;
     }
     num_of_full_mapped_pages = (vma->vm_end - vma->vm_start) % VINTAGE2D_PAGE_SIZE == 0 ?
                                num_of_mmaped_pages : num_of_mmaped_pages - 1;
@@ -592,7 +596,7 @@ int vintage_mmap(struct file *file, struct vm_area_struct *vma)
         if (remap_pfn_range(vma, vma->vm_start + offset,
                             __pa(pages[i].cpu_addr) >> PAGE_SHIFT,
                             VINTAGE2D_PAGE_SIZE, vma->vm_page_prot) < 0) {
-            goto remap_failed;
+            return -EAGAIN;
         }
     }
     if (num_of_full_mapped_pages < num_of_mmaped_pages) {
@@ -601,18 +605,10 @@ int vintage_mmap(struct file *file, struct vm_area_struct *vma)
                             __pa(pages[i].cpu_addr) >> PAGE_SHIFT,
                             vma->vm_end - (vma->vm_start + offset),
                             vma->vm_page_prot) < 0) {
-            goto remap_failed;
+            return -EAGAIN;
         }
     }
-    up(&dev_context->sem);
     return 0;
-invalid_cmd:
-    up(&dev_context->sem);
-    return -EINVAL;
-remap_failed:
-    up(&dev_context->sem);
-    printk(KERN_ERR "vintage_mmap failed\n");
-    return -EAGAIN;
 }
 
 int vintage_open(struct inode *inode, struct file *file)
