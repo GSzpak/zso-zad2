@@ -4,17 +4,10 @@
 #include <linux/dma-mapping.h>
 #include <linux/err.h>
 #include <linux/fs.h>
-#include <linux/irqreturn.h>
-#include <linux/init.h>
 #include <linux/interrupt.h>
-#include <linux/mm.h>
 #include <linux/module.h>
-#include <linux/mutex.h>
-#include <linux/io.h>
 #include <linux/pci.h>
 #include <linux/sched.h>
-#include <linux/slab.h>
-#include <linux/wait.h>
 #include "vintage2d.h"
 #include "v2d_ioctl.h"
 
@@ -73,7 +66,7 @@ typedef struct dev_context_info dev_context_info_t;
 
 struct pci_dev_info {
     int device_number;
-    unsigned int minor;
+    int minor;
     dev_t dev_number;
     struct pci_dev *pci_dev;
     struct cdev *char_dev;
@@ -130,7 +123,7 @@ static struct file_operations vintage_file_ops = {
 };
 static dev_t dev_number;
 static unsigned int major;
-static pci_dev_info_t pci_dev_info[MAX_NUM_OF_DEVICES];
+static pci_dev_info_t dev_info_array[MAX_NUM_OF_DEVICES];
 static struct class *vintage_class;
 
 MODULE_DEVICE_TABLE(pci, pci_ids);
@@ -152,47 +145,51 @@ void reset_dev_info(pci_dev_info_t *pci_dev_info)
     pci_dev_info->current_context = NULL;
 }
 
-void init_pci_dev_info(unsigned int first_minor)
+void init_pci_dev_info(pci_dev_info_t dev_info_arr[], unsigned int size,
+                       int first_minor)
 {
     int i;
-    for (i = 0; i < MAX_NUM_OF_DEVICES; ++i) {
-        pci_dev_info[i].device_number = i;
-        pci_dev_info[i].minor = first_minor++;
-        pci_dev_info[i].dev_number = MKDEV(major, pci_dev_info[i].minor);
-        mutex_init(&pci_dev_info[i].mutex);
-        init_waitqueue_head(&pci_dev_info[i].wait_queue);
-        reset_dev_info(pci_dev_info + i);
+    for (i = 0; i < size; ++i) {
+        dev_info_arr[i].device_number = i;
+        dev_info_arr[i].minor = first_minor++;
+        dev_info_arr[i].dev_number = MKDEV(major, dev_info_arr[i].minor);
+        mutex_init(&dev_info_arr[i].mutex);
+        init_waitqueue_head(&dev_info_arr[i].wait_queue);
+        reset_dev_info(dev_info_arr + i);
     }
 }
 // TODO: Synchronization in probe / remove?
-pci_dev_info_t *get_first_free_device_info(void)
+pci_dev_info_t *get_first_free_device_info(pci_dev_info_t dev_info_arr[],
+                                           unsigned int size)
 {
     int i;
-    for (i = 0; i < MAX_NUM_OF_DEVICES; ++i) {
-        if (pci_dev_info[i].pci_dev == NULL) {
-            return pci_dev_info + i;
+    for (i = 0; i < size; ++i) {
+        if (dev_info_arr[i].pci_dev == NULL) {
+            return dev_info_arr + i;
         }
     }
     return NULL;
 }
 
-pci_dev_info_t *get_dev_info(struct pci_dev *dev)
+pci_dev_info_t *get_dev_info(pci_dev_info_t dev_info_arr[], unsigned int size,
+                             struct pci_dev *dev)
 {
     int i;
-    for (i = 0; i < MAX_NUM_OF_DEVICES; ++i) {
-        if (pci_dev_info[i].pci_dev == dev) {
-            return pci_dev_info + i;
+    for (i = 0; i < size; ++i) {
+        if (dev_info_arr[i].pci_dev == dev) {
+            return dev_info_arr + i;
         }
     }
     return NULL;
 }
 
-pci_dev_info_t *get_dev_info_by_minor(int minor)
+pci_dev_info_t *get_dev_info_by_minor(pci_dev_info_t dev_info_arr[],
+                                      unsigned int size, int minor)
 {
     int i;
-    for (i = 0; i < MAX_NUM_OF_DEVICES; ++i) {
-        if (pci_dev_info[i].minor == minor) {
-            return pci_dev_info + i;
+    for (i = 0; i < size; ++i) {
+        if (dev_info_arr[i].minor == minor) {
+            return dev_info_arr + i;
         }
     }
     return NULL;
@@ -623,7 +620,7 @@ int vintage_open(struct inode *inode, struct file *file)
     int minor;
 
     minor = iminor(inode);
-    dev_info = get_dev_info_by_minor(minor);
+    dev_info = get_dev_info_by_minor(dev_info_array, MAX_NUM_OF_DEVICES, minor);
     if (dev_info == NULL) {
         printk(KERN_WARNING "Device with minor number %d not found\n", minor);
         return -ENODEV;
@@ -704,12 +701,12 @@ void reset_device(pci_dev_info_t *dev_info)
 {
     /* Reset device */
     send_to_dev(VINTAGE2D_RESET_DRAW | VINTAGE2D_RESET_FIFO | VINTAGE2D_RESET_TLB,
-                pci_dev_info, VINTAGE2D_RESET);
+                dev_info, VINTAGE2D_RESET);
     /* Reset interrupts */
     send_to_dev(VINTAGE2D_INTR_NOTIFY | VINTAGE2D_INTR_INVALID_CMD |
                 VINTAGE2D_INTR_PAGE_FAULT | VINTAGE2D_INTR_CANVAS_OVERFLOW |
                 VINTAGE2D_INTR_FIFO_OVERFLOW,
-                pci_dev_info, VINTAGE2D_INTR);
+                dev_info, VINTAGE2D_INTR);
 }
 
 void start_device(pci_dev_info_t *dev_info)
@@ -719,10 +716,10 @@ void start_device(pci_dev_info_t *dev_info)
     send_to_dev(VINTAGE2D_INTR_NOTIFY | VINTAGE2D_INTR_INVALID_CMD |
                 VINTAGE2D_INTR_PAGE_FAULT | VINTAGE2D_INTR_CANVAS_OVERFLOW |
                 VINTAGE2D_INTR_FIFO_OVERFLOW,
-                pci_dev_info, VINTAGE2D_INTR_ENABLE);
+                dev_info, VINTAGE2D_INTR_ENABLE);
     /* Enable drawing and fetching commands */
     send_to_dev(VINTAGE2D_ENABLE_DRAW | VINTAGE2D_ENABLE_FETCH_CMD,
-                pci_dev_info, VINTAGE2D_ENABLE);
+                dev_info, VINTAGE2D_ENABLE);
 }
 
 void init_command_buffer(pci_dev_info_t *pci_dev_info)
@@ -753,7 +750,7 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
 
     printk(KERN_WARNING "Vintage probe\n");
 
-    pci_dev_info = get_first_free_device_info();
+    pci_dev_info = get_first_free_device_info(dev_info_array, MAX_NUM_OF_DEVICES);
     if (pci_dev_info == NULL) {
         printk(KERN_ERR "Failed to add new device\n");
         // TODO: Which error? (Check everywhere)
@@ -870,8 +867,8 @@ device_create_failed:
 
 void stop_device(pci_dev_info_t *dev_info)
 {
-    send_to_dev(0x0, pci_dev_info, VINTAGE2D_ENABLE);
-    send_to_dev(0x0, pci_dev_info, VINTAGE2D_INTR_ENABLE);
+    send_to_dev(0x0, dev_info, VINTAGE2D_ENABLE);
+    send_to_dev(0x0, dev_info, VINTAGE2D_INTR_ENABLE);
     reset_device(dev_info);
 }
 
@@ -905,7 +902,7 @@ static void vintage_remove(struct pci_dev *dev)
     pci_dev_info_t *pci_dev_info;
     printk(KERN_WARNING "Vintage remove\n");
 
-    pci_dev_info = get_dev_info(dev);
+    pci_dev_info = get_dev_info(dev_info_array, MAX_NUM_OF_DEVICES, dev);
     if (pci_dev_info == NULL) {
         printk(KERN_WARNING "Vintage remove: device not found in device table - "
                        "probably is already removed\n");
@@ -940,7 +937,7 @@ static int vintage_init_module(void)
 
     /* Init helper structures */
     major = MAJOR(dev_number);
-    init_pci_dev_info(MINOR(dev_number));
+    init_pci_dev_info(dev_info_array, MAX_NUM_OF_DEVICES, MINOR(dev_number));
 
     /* register pci driver */
     ret = pci_register_driver(&vintage_driver);
@@ -972,7 +969,7 @@ static void vintage_exit_module(void)
 
     /* Remove devices */
     for(i = 0; i < MAX_NUM_OF_DEVICES; ++i) {
-        remove_device(pci_dev_info + i);
+        remove_device(dev_info_array + i);
     }
 
     /* free major/minor number */
