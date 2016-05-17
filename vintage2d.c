@@ -452,8 +452,8 @@ ssize_t vintage_write(struct file *file, const char *buffer,
         }
     }
     //printk(KERN_DEBUG "Success %d\n", i);
-    up(&dev_info->sem);
     up(&dev_context->sem);
+    up(&dev_info->sem);
     return size;
 write_error:
     up(&dev_context->sem);
@@ -668,23 +668,28 @@ int vintage_fsync(struct file *file, loff_t offset1, loff_t offset2,
 irqreturn_t irq_handler(int irq, void *dev)
 {
     int interrupt;
-    pci_dev_info_t *dev_info = (pci_dev_info_t *) dev;
-    interrupt = ioread32(dev_info->iomem + VINTAGE2D_INTR);
+    pci_dev_info_t *dev_info;
+
+    dev_info = (pci_dev_info_t *) dev;
+    interrupt = read_from_dev(dev_info, VINTAGE2D_INTR);
     if (interrupt & VINTAGE2D_INTR_NOTIFY) {
-        printk(KERN_DEBUG "INTERRUPT: notify");
+        /* Either there is space in buffer or device finished its job */
+        wake_up(&dev_info->wait_queue);
     }
+    /* Neither of cases below should happen */
     if (interrupt & VINTAGE2D_INTR_INVALID_CMD) {
-        printk(KERN_WARNING "INTERRUPT: invalid_cmd");
+        printk(KERN_ERR "Vintage2D interrupt: invalid command");
     }
     if (interrupt & VINTAGE2D_INTR_PAGE_FAULT) {
-        printk(KERN_WARNING "INTERRUPT: page fault");
+        printk(KERN_ERR "Vintage2D interrupt: page fault");
     }
     if (interrupt & VINTAGE2D_INTR_CANVAS_OVERFLOW) {
-        printk(KERN_WARNING "INTERRUPT: canvas overflow");
+        printk(KERN_ERR "Vintage2D interrupt: canvas overflow");
     }
     if (interrupt & VINTAGE2D_INTR_FIFO_OVERFLOW) {
-        printk(KERN_WARNING "INTERRUPT: fifo overflow");
+        printk(KERN_ERR "Vintage2D interrupt: FIFO overflow");
     }
+    /* Mark all interrupts as handled */
     send_to_dev(interrupt, dev_info, VINTAGE2D_INTR);
     return IRQ_HANDLED;
 }
