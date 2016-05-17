@@ -15,7 +15,7 @@
 #include <linux/pci.h>
 #include <linux/semaphore.h>
 #include <linux/slab.h>
-#include <linux/delay.h>
+#include <linux/wait.h>
 #include "vintage2d.h"
 #include "v2d_ioctl.h"
 
@@ -30,10 +30,14 @@ MODULE_LICENSE("GPL");
 #define MMIO_SIZE                           4096
 #define COMMAND_BUF_SIZE                    65536
 #define COMMAND_SIZE                        4
+/* Last 4 bytes are reserved for JUMP command */
+#define REAL_BUF_SIZE                       (COMMAND_BUF_SIZE - COMMAND_SIZE)
 #define MAX_WIDTH                           2048
 #define MAX_HEIGHT                          2048
 #define MIN_WIDTH                           1
 #define MIN_HEIGHT                          1
+/* Buffer size for SRC_POS / DST_POS / FILL_COLOR commands */
+#define HIS_BUF_SIZE                        2
 #define REQUIRED_POS_CMD_BITS_ZERO(cmd)     (((cmd) & (1 << 19 | 1 << 31)) == 0)
 #define REQUIRED_FILL_COLOR_BITS_ZERO(cmd)  (((cmd) & 0xffff0000) == 0)
 #define REQUIRED_DRAW_CMD_BITS_ZERO(cmd)    (((cmd) & (1 << 19 | 1 << 31)) == 0)
@@ -53,31 +57,40 @@ typedef struct {
 } canvas_page_info_t;
 
 typedef struct {
-    long last_src_pos;
-    long last_dst_pos;
-    long last_fill_color;
-} command_info_t;
+    long prev_commands[HIS_BUF_SIZE];
+    int ind;
+} command_his_t;
 
 typedef struct {
+    vintage_mem_t buf;
+    long *cpu_write_ptr;
+    dma_addr_t dma_write_ptr;
+} command_buf_t;
+
+typedef struct pci_dev_info pci_dev_info_t;
+typedef struct dev_context_info dev_context_info_t;
+
+struct pci_dev_info {
     int device_number;
     unsigned int minor;
     dev_t dev_number;
     struct pci_dev *pci_dev;
     struct cdev *char_dev;
     void __iomem *iomem;
-    vintage_mem_t command_buf;
+    command_buf_t command_buf;
     struct semaphore sem;
-} pci_dev_info_t;
+    dev_context_info_t *current_context;
+};
 
-typedef struct {
+struct dev_context_info {
     pci_dev_info_t *pci_dev_info;
     int was_ioctl;
     canvas_page_info_t canvas_page_info;
     long canvas_height;
     long canvas_width;
-    command_info_t command_info;
+    command_his_t command_his;
     struct semaphore sem;
-} dev_context_info_t;
+};
 
 
 /******************** Function declarations ****************************/
@@ -117,11 +130,23 @@ static dev_t dev_number;
 static unsigned int major;
 static pci_dev_info_t pci_dev_info[MAX_NUM_OF_DEVICES];
 static struct class *vintage_class;
+DECLARE_WAIT_QUEUE_HEAD(wait_queue);
 
 /******************** Definitions ****************************/
 
 
 /******************** Utils ****************************/
+
+void reset_dev_info(pci_dev_info_t *pci_dev_info)
+{
+    pci_dev_info->pci_dev = NULL;
+    pci_dev_info->char_dev = NULL;
+    pci_dev_info->iomem = NULL;
+    pci_dev_info->command_buf.buf.cpu_addr = NULL;
+    pci_dev_info->command_buf.buf.dma_addr = 0;
+    pci_dev_info->command_buf.cpu_write_ptr = NULL;
+    pci_dev_info->command_buf.dma_write_ptr = 0;
+}
 
 void init_pci_dev_info(unsigned int first_minor)
 {
@@ -130,15 +155,12 @@ void init_pci_dev_info(unsigned int first_minor)
         pci_dev_info[i].device_number = i;
         pci_dev_info[i].minor = first_minor++;
         pci_dev_info[i].dev_number = MKDEV(major, pci_dev_info[i].minor);
-        pci_dev_info[i].pci_dev = NULL;
-        pci_dev_info[i].char_dev = NULL;
-        pci_dev_info[i].iomem = NULL;
-        pci_dev_info->command_buf.cpu_addr = NULL;
-        pci_dev_info->command_buf.dma_addr = 0;
+        reset_dev_info(pci_dev_info + i);
     }
 }
 // TODO: Synchronization in probe / remove?
-pci_dev_info_t *get_first_free_device_info(void) {
+pci_dev_info_t *get_first_free_device_info(void)
+{
     int i;
     for (i = 0; i < MAX_NUM_OF_DEVICES; ++i) {
         if (pci_dev_info[i].pci_dev == NULL) {
@@ -148,7 +170,8 @@ pci_dev_info_t *get_first_free_device_info(void) {
     return NULL;
 }
 
-pci_dev_info_t *get_dev_info(struct pci_dev *dev) {
+pci_dev_info_t *get_dev_info(struct pci_dev *dev)
+{
     int i;
     for (i = 0; i < MAX_NUM_OF_DEVICES; ++i) {
         if (pci_dev_info[i].pci_dev == dev) {
@@ -158,7 +181,8 @@ pci_dev_info_t *get_dev_info(struct pci_dev *dev) {
     return NULL;
 }
 
-pci_dev_info_t *get_dev_info_by_minor(int minor) {
+pci_dev_info_t *get_dev_info_by_minor(int minor)
+{
     int i;
     for (i = 0; i < MAX_NUM_OF_DEVICES; ++i) {
         if (pci_dev_info[i].minor == minor) {
@@ -170,10 +194,61 @@ pci_dev_info_t *get_dev_info_by_minor(int minor) {
 
 /******************** Write ****************************/
 
-// TODO: remove
 void send_to_dev(long val, pci_dev_info_t *dev_info, long reg)
 {
     iowrite32(val, dev_info->iomem + reg);
+}
+
+unsigned int read_from_dev(pci_dev_info_t *dev_info, long reg)
+{
+    return ioread32(dev_info->iomem + reg);
+}
+
+void do_sync()
+{
+
+}
+
+long *get_last_command_addr(command_buf_t *buf)
+{
+    return ((long *) buf->buf.cpu_addr) + REAL_BUF_SIZE / COMMAND_SIZE;
+}
+
+void add_cmd_to_buf(pci_dev_info_t *dev_info, long cmd)
+{
+    command_buf_t *buf = &dev_info->command_buf;
+    *buf->cpu_write_ptr = cmd;
+    buf->cpu_write_ptr += 1;
+    buf->dma_write_ptr += COMMAND_SIZE;
+    if (buf->cpu_write_ptr == get_last_command_addr(buf)) {
+        buf->cpu_write_ptr = (long *) buf->buf.cpu_addr;
+        buf->dma_write_ptr = buf->buf.dma_addr;
+    }
+    send_to_dev(buf->buf.dma_addr, dev_info, VINTAGE2D_CMD_WRITE_PTR);
+}
+
+void wait_for_space(pci_dev_info_t *dev_info, unsigned int num_of_cmds)
+{
+    wait_event(wait_queue,
+               ((read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR) -
+                 dev_info->command_buf.dma_write_ptr +
+                 REAL_BUF_SIZE) % REAL_BUF_SIZE ==
+                num_of_cmds * COMMAND_SIZE));
+}
+
+void change_context(pci_dev_info_t *dev_info, dev_context_info_t *context)
+{
+    do_sync();
+    /* Reset TLB */
+    send_to_dev(VINTAGE2D_RESET_TLB, dev_info, VINTAGE2D_RESET);
+    wait_for_space(dev_info, 2);
+    add_cmd_to_buf(dev_info,
+                   VINTAGE2D_CMD_CANVAS_PT(
+                           context->canvas_page_info.page_table.dma_addr, 0));
+    add_cmd_to_buf(dev_info,
+                   VINTAGE2D_CMD_CANVAS_DIMS(context->canvas_width,
+                                             context->canvas_height, 1));
+    dev_info->current_context = context;
 }
 
 int check_pos_cmd(long cmd, long x, long y, dev_context_info_t *dev_context)
@@ -190,94 +265,120 @@ int check_pos_cmd(long cmd, long x, long y, dev_context_info_t *dev_context)
     return 0;
 }
 
-long get_vintage_src_pos_cmd(long cmd, dev_context_info_t *dev_context,
-                             int notify)
+void add_cmd_to_his(dev_context_info_t * dev_context, long cmd)
+{
+    dev_context->command_his.prev_commands[dev_context->command_his.ind] = cmd;
+    dev_context->command_his.ind = (dev_context->command_his.ind + 1) % HIS_BUF_SIZE;
+}
+
+long get_cmd_from_his(dev_context_info_t *dev_context, long cmd_type)
+{
+    int i;
+    for (i = 0; i < HIS_BUF_SIZE; ++i) {
+        if (V2D_CMD_TYPE(dev_context->command_his.prev_commands[i]) == cmd_type) {
+            return dev_context->command_his.prev_commands[i];
+        }
+    }
+    return -1;
+}
+
+void clear_his(dev_context_info_t *dev_context)
+{
+    memset(&dev_context->command_his.prev_commands, 0,
+           sizeof(dev_context->command_his.prev_commands));
+    dev_context->command_his.ind = 0;
+}
+
+int handle_src_or_dst_pos_cmd(long cmd, pci_dev_info_t *dev_info)
 {
     long pos_x, pos_y;
     pos_x = V2D_CMD_POS_X(cmd);
     pos_y = V2D_CMD_POS_Y(cmd);
-    if (check_pos_cmd(cmd, pos_x, pos_y, dev_context) < 0) {
-        printk(KERN_DEBUG "Check_pos failed");
+    if (check_pos_cmd(cmd, pos_x, pos_y, dev_info->current_context) < 0) {
         return -1;
     }
-    dev_context->command_info.last_src_pos = cmd;
-    return VINTAGE2D_CMD_SRC_POS(pos_x, pos_y, notify);
+    add_cmd_to_his(dev_info->current_context, cmd);
+    return 0;
 }
 
-long get_vintage_dst_pos_cmd(long cmd, dev_context_info_t *dev_context,
-                             int notify)
+int handle_fill_color_cmd(long cmd, pci_dev_info_t *dev_info)
 {
-    long pos_x, pos_y;
-    pos_x = V2D_CMD_POS_X(cmd);
-    pos_y = V2D_CMD_POS_Y(cmd);
-    if (check_pos_cmd(cmd, pos_x, pos_y, dev_context) < 0) {
-        return -1;
-    }
-    dev_context->command_info.last_dst_pos = cmd;
-    return VINTAGE2D_CMD_DST_POS(pos_x, pos_y, noftify);
-}
-
-long get_vintage_fill_color_cmd(long cmd, dev_context_info_t *dev_context,
-                                int notify)
-{
-    long color;
-    printk(KERN_DEBUG "color %p", cmd);
     if (!REQUIRED_FILL_COLOR_BITS_ZERO(cmd)) {
-        printk(KERN_DEBUG "check color failed");
         return -1;
     }
-    color = VINTAGE2D_CMD_COLOR(cmd);
-    dev_context->command_info.last_fill_color = cmd;
-    return send_cmd(VINTAGE2D_CMD_FILL_COLOR(color, notify);
+    add_cmd_to_his(dev_info->current_context, cmd);
+    return 0;
 }
 
-long get_vintage_do_blit_cmd(long cmd, dev_context_info_t * dev_context,
-                             int notify)
+int handle_do_blit_cmd(long cmd, pci_dev_info_t *dev_info)
 {
+    long src_pos_cmd, dst_pos_cmd;
     long src_pos_x, src_pos_y, dst_pos_x, dst_pos_y, width, height;
-    if (!REQUIRED_DRAW_CMD_BITS_ZERO(cmd) ||
-            dev_context->command_info.last_src_pos == 0 ||
-            dev_context->command_info.last_dst_pos == 0) {
+
+    if (!REQUIRED_DRAW_CMD_BITS_ZERO(cmd)) {
         return -1;
     }
-    src_pos_x = V2D_CMD_POS_X(dev_context->command_info.last_src_pos);
-    src_pos_y = V2D_CMD_POS_Y(dev_context->command_info.last_src_pos);
-    dst_pos_x = V2D_CMD_POS_X(dev_context->command_info.last_dst_pos);
-    dst_pos_y = V2D_CMD_POS_Y(dev_context->command_info.last_dst_pos);
+
+    src_pos_cmd = get_cmd_from_his(dev_info->current_context,
+                                   VINTAGE2D_CMD_TYPE_SRC_POS);
+    dst_pos_cmd = get_cmd_from_his(dev_info->current_context,
+                                   VINTAGE2D_CMD_TYPE_DST_POS);
+    if (src_pos_cmd == -1 || dst_pos_cmd == -1) {
+        printk(KERN_WARNING "DO_BLIT should be preceded by SRC_POS and DST_POS\n");
+        return -1;
+    }
+    src_pos_x = V2D_CMD_POS_X(src_pos_cmd);
+    src_pos_y = V2D_CMD_POS_Y(src_pos_cmd);
+    dst_pos_x = V2D_CMD_POS_X(dst_pos_cmd);
+    dst_pos_y = V2D_CMD_POS_Y(dst_pos_cmd);
     width = V2D_CMD_WIDTH(cmd);
     height = V2D_CMD_HEIGHT(cmd);
-    printk(KERN_DEBUG "Check blit: src_x %d, src_y %d, dst_x %d, dst_y %d, width %d, height %d\n",
-           src_pos_x, src_pos_y, dst_pos_x, dst_pos_y, width, height);
-    if (src_pos_x + width > dev_context->canvas_width ||
-            dst_pos_x + width > dev_context->canvas_width ||
-            src_pos_y + height > dev_context->canvas_height ||
-            dst_pos_y + height > dev_context->canvas_height) {
+    //printk(KERN_DEBUG "Check blit: src_x %d, src_y %d, dst_x %d, dst_y %d, width %d, height %d\n",
+    //       src_pos_x, src_pos_y, dst_pos_x, dst_pos_y, width, height);
+    if (src_pos_x + width > dev_info->current_context->canvas_width ||
+            dst_pos_x + width > dev_info->current_context->canvas_width ||
+            src_pos_y + height > dev_info->current_context->canvas_height ||
+            dst_pos_y + height > dev_info->current_context->canvas_height) {
         return -1;
     }
-    // TODO: Zero last src, last dst
-    return VINTAGE2D_CMD_DO_BLIT(width, height, notify);
+    wait_for_space(dev_info, 3);
+    add_cmd_to_buf(dev_info, VINTAGE2D_CMD_DST_POS(dst_pos_x, dst_pos_y, 0));
+    add_cmd_to_buf(dev_info, VINTAGE2D_CMD_SRC_POS(src_pos_x, src_pos_y, 0));
+    add_cmd_to_buf(dev_info, VINTAGE2D_CMD_DO_BLIT(width, height, 1));
+    clear_his(dev_info->current_context);
+    return 0;
 }
 
-long get_vintage_do_fill_cmd(long cmd, dev_context_info_t * dev_context,
-                             int notify)
+int handle_do_fill_cmd(long cmd, pci_dev_info_t *dev_info)
 {
-    long dst_pos_x, dst_pos_y, width, height;
-    if (!REQUIRED_DRAW_CMD_BITS_ZERO(cmd) ||
-            dev_context->command_info.last_fill_color == 0 ||
-            dev_context->command_info.last_dst_pos == 0) {
+    long fill_color_cmd, dst_pos_cmd, dst_pos_x, dst_pos_y, width, height, color;
+    if (!REQUIRED_DRAW_CMD_BITS_ZERO(cmd)) {
         return -1;
     }
-    dst_pos_x = V2D_CMD_POS_X(dev_context->command_info.last_dst_pos);
-    dst_pos_y = V2D_CMD_POS_Y(dev_context->command_info.last_dst_pos);
+    dst_pos_cmd = get_cmd_from_his(dev_info->current_context,
+                                   VINTAGE2D_CMD_TYPE_DST_POS);
+    fill_color_cmd = get_cmd_from_his(dev_info->current_context,
+                                      VINTAGE2D_CMD_TYPE_FILL_COLOR);
+    if (dst_pos_cmd == -1 || fill_color_cmd == -1) {
+        printk(KERN_WARNING "DO_FILL should be preceded by DST_POS and FILL_COLOR\n");
+        return -1;
+    }
+    dst_pos_x = V2D_CMD_POS_X(dst_pos_cmd);
+    dst_pos_y = V2D_CMD_POS_Y(dst_pos_cmd);
     width = V2D_CMD_WIDTH(cmd);
     height = V2D_CMD_HEIGHT(cmd);
-    if (dst_pos_x + width > dev_context->canvas_width ||
-            dst_pos_y + height > dev_context->canvas_height) {
+    if (dst_pos_x + width > dev_info->current_context->canvas_width ||
+            dst_pos_y + height > dev_info->current_context->canvas_height) {
         return -1;
     }
-    return VINTAGE2D_CMD_DO_FILL(width, height, notify);
-    // TODO: Zero last src, last dst
+    color = V2D_CMD_COLOR(fill_color_cmd);
+    wait_for_space(dev_info, 3);
+    add_cmd_to_buf(dev_info, VINTAGE2D_CMD_DST_POS(dst_pos_x, dst_pos_y, 0));
+    add_cmd_to_buf(dev_info, VINTAGE2D_CMD_FILL_COLOR(color, 0));
+    add_cmd_to_buf(dev_info, VINTAGE2D_CMD_DO_FILL(width, height, 1));
+    clear_his(dev_info->current_context);
 }
+
 
 ssize_t vintage_write(struct file *file, const char *buffer,
                       size_t size, loff_t *offset)
@@ -286,7 +387,7 @@ ssize_t vintage_write(struct file *file, const char *buffer,
     size_t bytes_sent, bytes_to_copy, elems_in_buffer;
     dev_context_info_t *dev_context;
     pci_dev_info_t *dev_info;
-    long (*get_vintage_cmd_function) (long, dev_context_info_t *, int);
+    int (*handle_cmd_function) (long, pci_dev_info_t *);
 
     dev_context = (dev_context_info_t *) file->private_data;
     dev_info = dev_context->pci_dev_info;
@@ -297,54 +398,46 @@ ssize_t vintage_write(struct file *file, const char *buffer,
     }
     bytes_sent = 0;
     down(&dev_info->sem);
-    // TODO: Check context
-    /* Reset TLB */
-    iowrite32(VINTAGE2D_RESET_TLB, pci_dev_info->iomem + VINTAGE2D_RESET);
-    while (bytes_sent < size) {
-
+    if (dev_info->current_context != dev_context) {
+        change_context(dev_info, dev_context);
     }
-    send_cmd(VINTAGE2D_CMD_CANVAS_PT(dev_context->canvas_page_info.page_table.dma_addr, 1),
-             dev_context);
-    send_cmd(VINTAGE2D_CMD_CANVAS_DIMS(dev_context->canvas_width, dev_context->canvas_height, 1),
-             dev_context);
     for (i = 0; i < size; i += sizeof(unsigned long)) {
         if (copy_from_user(&current_command, buffer + i,
                 sizeof(unsigned long)) != 0) {
-            printk(KERN_DEBUG "Write efault\n");
             return -EFAULT;
         }
         switch (V2D_CMD_TYPE(current_command)) {
             case VINTAGE2D_CMD_TYPE_SRC_POS:
-                printk(KERN_DEBUG "src pos\n");
-                get_vintage_cmd_function = get_vintage_src_pos_cmd;
-                break;
+                // TODO: Remove all KERN_DEBUG
+                //printk(KERN_DEBUG "src pos\n");
             case V2D_CMD_TYPE_DST_POS:
-                printk(KERN_DEBUG "dst pos\n");
-                get_vintage_cmd_function = get_vintage_dst_pos_cmd;
+                //printk(KERN_DEBUG "dst pos\n");
+                handle_cmd_function = handle_src_or_dst_pos_cmd;
                 break;
             case V2D_CMD_TYPE_FILL_COLOR:
-                printk(KERN_DEBUG "fill\n");
-                get_vintage_cmd_function = get_vintage_fill_color_cmd;
+                //printk(KERN_DEBUG "fill\n");
+                handle_cmd_function = handle_fill_color_cmd;
                 break;
             case V2D_CMD_TYPE_DO_BLIT:
-                printk(KERN_DEBUG "do blit\n");
-                get_vintage_cmd_function = get_vintage_do_blit_cmd;
+                //printk(KERN_DEBUG "do blit\n");
+                handle_cmd_function = handle_do_blit_cmd;
                 break;
             case V2D_CMD_TYPE_DO_FILL:
-                printk(KERN_DEBUG "do fill\n");
-                get_vintage_cmd_function = get_vintage_do_fill_cmd;
+                //printk(KERN_DEBUG "do fill\n");
+                handle_cmd_function = handle_do_fill_cmd;
                 break;
             default:
                 return -EINVAL;
         }
-        if (get_vintage_cmd_function(current_command, dev_context) < 0) {
-            printk(KERN_DEBUG "Invalid command\n");
+        if (handle_cmd_function(current_command, dev_info) < 0) {
+            printk(KERN_WARNING "Invalid command: %ld\n", current_command);
             return -EINVAL;
         }
     }
-    printk(KERN_DEBUG "Success %d\n", i);
+    //printk(KERN_DEBUG "Success %d\n", i);
+    up(&dev_info->sem);
     up(&dev_context->sem);
-    return i;
+    return size;
 }
 
 /******************** ioctl & alloc ****************************/
@@ -463,9 +556,9 @@ int vintage_mmap(struct file *file, struct vm_area_struct *vma)
     if (!dev_context->was_ioctl) {
         return -EINVAL;
     }
-    up(&dev_context->sem);
     num_of_allocated_pages = dev_context->canvas_page_info.num_of_pages;
     pages = dev_context->canvas_page_info.pages;
+    // FIXME: DIV_UP
     num_of_mmaped_pages = (vma->vm_end - vma->vm_start) / VINTAGE2D_PAGE_SIZE;
     if (num_of_mmaped_pages > num_of_allocated_pages) {
         return -EINVAL;
@@ -479,6 +572,7 @@ int vintage_mmap(struct file *file, struct vm_area_struct *vma)
             return -EAGAIN;
         }
     }
+    up(&dev_context->sem);
     return 0;
 }
 
@@ -509,7 +603,6 @@ int vintage_release(struct inode *inode, struct file *file)
 {
     dev_context_info_t *dev_context;
     /* Called always only once, no synchronization needed */
-    // TODO: Are you sure?
     dev_context = (dev_context_info_t *) file->private_data;
     if (dev_context->was_ioctl) {
         cleanup_canvas_pages(&dev_context->pci_dev_info->pci_dev->dev,
@@ -572,15 +665,18 @@ void start_device(pci_dev_info_t *dev_info)
 
 int init_command_buffer(pci_dev_info_t *pci_dev_info)
 {
-    long *last_command;
-    int commands_in_buf = COMMAND_BUF_SIZE / COMMAND_SIZE;
-    last_command = (long *) pci_dev_info->command_buf.cpu_addr + commands_in_buf - 1;
-    *last_command = JUMP_TO(pci_dev_info->command_buf.dma_addr);
+    long *last_command_addr;
+    last_command_addr = get_last_command_addr(&pci_dev_info->command_buf);
+    *last_command_addr = JUMP_TO(pci_dev_info->command_buf.buf.dma_addr);
     /* Initialize CMD_READ_PTR and CMD_WRITE_PTR */
-    send_to_dev(pci_dev_info->command_buf.dma_addr,
+    send_to_dev(pci_dev_info->command_buf.buf.dma_addr,
                 pci_dev_info, VINTAGE2D_CMD_READ_PTR);
-    send_to_dev(pci_dev_info->command_buf.dma_addr,
+    send_to_dev(pci_dev_info->command_buf.buf.dma_addr,
                 pci_dev_info, VINTAGE2D_CMD_WRITE_PTR);
+    pci_dev_info->command_buf.cpu_write_ptr =
+            (long *) pci_dev_info->command_buf.buf.cpu_addr;
+    pci_dev_info->command_buf.dma_write_ptr =
+            pci_dev_info->command_buf.buf.dma_addr;
 }
 
 static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
@@ -687,9 +783,8 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
     pci_dev_info->pci_dev = dev;
     pci_dev_info->char_dev = char_dev;
     pci_dev_info->iomem = iomem;
-    pci_dev_info->command_buf.cpu_addr = cpu_addr;
-    pci_dev_info->command_buf.dma_addr = dma_addr;
-    init_command_buffer(pci_dev_info);
+    pci_dev_info->command_buf.buf.cpu_addr = cpu_addr;
+    pci_dev_info->command_buf.buf.dma_addr = dma_addr;
     sema_init(&pci_dev_info->sem, 1);
     init_command_buffer(pci_dev_info);
     start_device(pci_dev_info);
@@ -719,24 +814,23 @@ void remove_device(pci_dev_info_t *pci_dev_info)
         /* Disable interrupts, draw and fetching commands */
         send_to_dev(0x0, pci_dev_info, VINTAGE2D_INTR_ENABLE);
         send_to_dev(0x0, pci_dev_info, VINTAGE2D_ENABLE);
-        pci_disable_device(pci_dev_info->pci_dev);
+        if (pci_is_enabled(pci_dev_info->pci_dev)) {
+            pci_disable_device(pci_dev_info->pci_dev);
+        }
         dma_free_coherent(&pci_dev_info->pci_dev->dev, COMMAND_BUF_SIZE,
-                          pci_dev_info->command_buf.cpu_addr,
-                          pci_dev_info->command_buf.dma_addr);
-        pci_dev_info->command_buf.cpu_addr = NULL;
-        pci_dev_info->command_buf.dma_addr = 0;
+                          pci_dev_info->command_buf.buf.cpu_addr,
+                          pci_dev_info->command_buf.buf.dma_addr);
         pci_clear_master(pci_dev_info->pci_dev);
         free_irq(pci_dev_info->pci_dev->irq, (void *) pci_dev_info);
         pci_iounmap(pci_dev_info->pci_dev, pci_dev_info->iomem);
-        pci_dev_info->iomem = NULL;
         pci_release_regions(pci_dev_info->pci_dev);
-        pci_dev_info->pci_dev = NULL;
         device_destroy(vintage_class, pci_dev_info->dev_number);
+
     }
     if (pci_dev_info->char_dev != NULL) {
         cdev_del(pci_dev_info->char_dev);
-        pci_dev_info->char_dev = NULL;
     }
+    reset_dev_info(pci_dev_info);
 }
 
 static void vintage_remove(struct pci_dev *dev)
