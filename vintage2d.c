@@ -531,15 +531,14 @@ vintage_write(struct file *file, const char *buffer, size_t size, loff_t *offset
 
     dev_context = (dev_context_info_t *) file->private_data;
     dev_info = dev_context->pci_dev_info;
-//    printk(KERN_ERR "Before write, read_ptr: %p, write_ptr: %p\n",
-//           read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR),
-//           read_from_dev(dev_info, VINTAGE2D_CMD_WRITE_PTR));
-    mutex_lock(&dev_info->mutex);
+
     mutex_lock(&dev_context->mutex);
     if (!dev_context->was_ioctl || (size % COMMAND_SIZE) != 0) {
-        err = -EINVAL;
-        goto write_error;
+        mutex_unlock(&dev_context->mutex);
+        return -EINVAL;
     }
+    mutex_unlock(&dev_context->mutex);
+    mutex_lock(&dev_info->mutex);
     if (dev_info->current_context != dev_context) {
         change_context(dev_info, dev_context);
     }
@@ -573,14 +572,9 @@ vintage_write(struct file *file, const char *buffer, size_t size, loff_t *offset
             goto write_error;
         }
     }
-    mutex_unlock(&dev_context->mutex);
     mutex_unlock(&dev_info->mutex);
-//    printk(KERN_ERR "After write, read_ptr: %p, write_ptr: %p\n",
-//           read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR),
-//           read_from_dev(dev_info, VINTAGE2D_CMD_WRITE_PTR));
     return size;
 write_error:
-    mutex_unlock(&dev_context->mutex);
     mutex_unlock(&dev_info->mutex);
     return err;
 }
@@ -667,8 +661,11 @@ vintage_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     if (cmd != V2D_IOCTL_SET_DIMENSIONS) {
         return -ENOTTY;
     }
+
     dev_context = (dev_context_info_t *) file->private_data;
+
     mutex_lock(&dev_context->mutex);
+
     if (dev_context->was_ioctl) {
         mutex_unlock(&dev_context->mutex);
         return -EINVAL;
@@ -775,8 +772,8 @@ vintage_fsync(struct file *file, loff_t offset1, loff_t offset2, int datasync)
     if (!dev_context->was_ioctl) {
         return -EINVAL;
     }
+    
     mutex_lock(&dev_context->pci_dev_info->mutex);
-
     if (dev_context->pci_dev_info->current_context == dev_context) {
         sync_dev(dev_context->pci_dev_info);
     }
