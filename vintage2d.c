@@ -643,7 +643,7 @@ alloc_memory_for_canvas(uint16_t canvas_width, uint16_t canvas_height,
             cleanup_canvas_pages(device, canvas_page_info, i);
             return -1;
         }
-        // TODO: Remove check and '& PAGE_MASK'
+        /* DMA address should be always aligned to frame size */
         WARN_ON((current_page->dma_addr & VINTAGE2D_PAGE_MASK) !=
                         current_page->dma_addr);
         page_entry_addr[i] =
@@ -700,39 +700,26 @@ vintage_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 int
 vintage_mmap(struct file *file, struct vm_area_struct *vma)
 {
-    unsigned long i, num_of_mmaped_pages, num_of_full_mapped_pages, offset;
+    unsigned long i, num_of_mapped_pages, offset;
     dev_context_info_t *dev_context;
     vintage_mem_t *pages;
-
-    // TODO: remove KERN_WARNING prints
-    printk(KERN_WARNING "MMAP %p %p\n", vma->vm_start, vma->vm_end);
 
     dev_context = (dev_context_info_t *) file->private_data;
     if (!dev_context->was_ioctl) {
         return -EINVAL;
     }
     pages = dev_context->canvas_page_info.pages;
-    num_of_mmaped_pages = DIV_ROUND_UP((vma->vm_end - vma->vm_start),
-                                       VINTAGE2D_PAGE_SIZE);
-    if (num_of_mmaped_pages > dev_context->canvas_page_info.num_of_pages) {
+    /* vm_area_struct should always cover area aligned to page size */
+    WARN_ON((vma->vm_end - vma->vm_start) % VINTAGE2D_PAGE_SIZE != 0);
+    num_of_mapped_pages = (vma->vm_end - vma->vm_start) / VINTAGE2D_PAGE_SIZE;
+    if (num_of_mapped_pages > dev_context->canvas_page_info.num_of_pages) {
         return -EINVAL;
     }
-    num_of_full_mapped_pages = (vma->vm_end - vma->vm_start) % VINTAGE2D_PAGE_SIZE == 0 ?
-                               num_of_mmaped_pages : num_of_mmaped_pages - 1;
-    for (i = 0; i < num_of_full_mapped_pages; ++i) {
+    for (i = 0; i < num_of_mapped_pages; ++i) {
         offset = i * VINTAGE2D_PAGE_SIZE;
         if (remap_pfn_range(vma, vma->vm_start + offset,
                             __pa(pages[i].cpu_addr) >> PAGE_SHIFT,
                             VINTAGE2D_PAGE_SIZE, vma->vm_page_prot) < 0) {
-            return -EAGAIN;
-        }
-    }
-    if (num_of_full_mapped_pages < num_of_mmaped_pages) {
-        offset = i * VINTAGE2D_PAGE_SIZE;
-        if (remap_pfn_range(vma, vma->vm_start + offset,
-                            __pa(pages[i].cpu_addr) >> PAGE_SHIFT,
-                            vma->vm_end - (vma->vm_start + offset),
-                            vma->vm_page_prot) < 0) {
             return -EAGAIN;
         }
     }
