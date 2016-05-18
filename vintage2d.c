@@ -89,7 +89,7 @@ struct dev_context_info {
     long canvas_height;
     long canvas_width;
     command_his_t command_his;
-    // Mutex to sync ioctl command and avoid errors in kernel
+    /* Mutex to sync ioctl command and therefore avoid errors in kernel */
     struct mutex mutex;
 };
 
@@ -138,7 +138,7 @@ MODULE_DEVICE_TABLE(pci, pci_ids);
 
 /******************** Definitions ****************************/
 
-// General device utils
+/* General device utils */
 
 void
 send_to_dev(long val, pci_dev_info_t *dev_info, long reg)
@@ -200,7 +200,7 @@ reset_dev_info(pci_dev_info_t *pci_dev_info)
     pci_dev_info->current_context = NULL;
 }
 
-// Utils for array of devices
+/* Utils for array of devices */
 // TODO: Synchronization in probe / remove?
 void
 init_pci_dev_info(pci_dev_info_t dev_info_arr[], unsigned int size,
@@ -255,7 +255,7 @@ get_dev_info_by_minor(pci_dev_info_t dev_info_arr[], unsigned int size,
     return NULL;
 }
 
-// Command buffer utils
+/* Command buffer utils */
 
 long *
 get_last_command_addr(command_buf_t *buf)
@@ -309,7 +309,7 @@ add_cmd_to_buf(pci_dev_info_t *dev_info, long cmd)
     send_to_dev(buf->dma_write_ptr, dev_info, VINTAGE2D_CMD_WRITE_PTR);
 }
 
-// File operations utils
+/* File operations utils */
 
 void
 sync_dev(pci_dev_info_t *dev_info)
@@ -705,14 +705,24 @@ vintage_open(struct inode *inode, struct file *file)
     return 0;
 }
 
+void
+do_fsync(dev_context_info_t *dev_context)
+{
+    mutex_lock(&dev_context->pci_dev_info->mutex);
+    if (dev_context->pci_dev_info->current_context == dev_context) {
+        sync_dev(dev_context->pci_dev_info);
+    }
+    mutex_unlock(&dev_context->pci_dev_info->mutex);
+}
+
 int
 vintage_release(struct inode *inode, struct file *file)
 {
     dev_context_info_t *dev_context;
-    /* Called always only once, no synchronization needed */
     dev_context = (dev_context_info_t *) file->private_data;
     if (dev_context->was_ioctl) {
-        // TODO: fsync
+        /* Perform fsync before closing */
+        do_fsync(dev_context);
         cleanup_canvas_pages(&dev_context->pci_dev_info->pci_dev->dev,
                              &dev_context->canvas_page_info,
                              dev_context->canvas_page_info.num_of_pages);
@@ -730,16 +740,11 @@ vintage_fsync(struct file *file, loff_t offset1, loff_t offset2, int datasync)
     if (!dev_context->was_ioctl) {
         return -EINVAL;
     }
-
-    mutex_lock(&dev_context->pci_dev_info->mutex);
-    if (dev_context->pci_dev_info->current_context == dev_context) {
-        sync_dev(dev_context->pci_dev_info);
-    }
-    mutex_unlock(&dev_context->pci_dev_info->mutex);
+    do_fsync(dev_context);
     return 0;
 }
 
-// Device operations
+/* Device operations */
 
 irqreturn_t
 irq_handler(int irq, void *dev)
@@ -938,6 +943,8 @@ vintage_remove(struct pci_dev *dev)
         remove_device(pci_dev_info);
     }
 }
+
+/* Module init / exit */
 
 static int
 vintage_init_module(void)
