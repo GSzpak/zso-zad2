@@ -807,7 +807,6 @@ vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
     char_dev->ops = &vintage_file_ops;
     ret = cdev_add(char_dev, pci_dev_info->dev_number, 1);
     if (ret < 0) {
-        // TODO: Free char_dev?
         printk(KERN_ERR "Vintage2D: failed to add char device\n");
         return ret;
     }
