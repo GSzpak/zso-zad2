@@ -89,6 +89,7 @@ struct dev_context_info {
     long canvas_height;
     long canvas_width;
     command_his_t command_his;
+    // Mutex to sync ioctl command and avoid errors in kernel
     struct mutex mutex;
 };
 
@@ -253,7 +254,6 @@ get_dev_info_by_minor(pci_dev_info_t dev_info_arr[], unsigned int size,
     }
     return NULL;
 }
-
 
 // Command buffer utils
 
@@ -490,12 +490,10 @@ vintage_write(struct file *file, const char *buffer, size_t size, loff_t *offset
     dev_context = (dev_context_info_t *) file->private_data;
     dev_info = dev_context->pci_dev_info;
 
-    mutex_lock(&dev_context->mutex);
     if (!dev_context->was_ioctl || (size % COMMAND_SIZE) != 0) {
-        mutex_unlock(&dev_context->mutex);
         return -EINVAL;
     }
-    mutex_unlock(&dev_context->mutex);
+
     mutex_lock(&dev_info->mutex);
     if (dev_info->current_context != dev_context) {
         change_context(dev_info, dev_context);
@@ -659,9 +657,11 @@ vintage_mmap(struct file *file, struct vm_area_struct *vma)
     vintage_mem_t *pages;
 
     dev_context = (dev_context_info_t *) file->private_data;
+
     if (!dev_context->was_ioctl) {
         return -EINVAL;
     }
+
     pages = dev_context->canvas_page_info.pages;
     /* vm_area_struct should always cover area aligned to page size */
     WARN_ON((vma->vm_end - vma->vm_start) % VINTAGE2D_PAGE_SIZE != 0);
