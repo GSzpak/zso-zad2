@@ -8,9 +8,10 @@
 #include <linux/module.h>
 #include <linux/pci.h>
 #include <linux/sched.h>
+#include <linux/delay.h>
 #include "vintage2d.h"
 #include "v2d_ioctl.h"
-
+// TODO: delete delay
 /******************** Defines ****************************/
 
 #define MAX_NUM_OF_DEVICES                  256
@@ -209,11 +210,40 @@ unsigned int read_from_dev(pci_dev_info_t *dev_info, long reg)
 
 void wait_for_space(pci_dev_info_t *dev_info, unsigned int num_of_cmds)
 {
-    wait_event(dev_info->wait_queue,
-               ((read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR) -
-                 dev_info->command_buf.dma_write_ptr +
-                 REAL_BUF_SIZE) % REAL_BUF_SIZE ==
-                num_of_cmds * COMMAND_SIZE));
+    /* Wait until there is enough space in circular buffer */
+    printk(KERN_ERR "wait for space\n");
+    int val1 = ((int)
+            (read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR) -
+             dev_info->command_buf.dma_write_ptr +
+             REAL_BUF_SIZE));
+    int val2 = ((int)
+            (read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR) -
+             dev_info->command_buf.dma_write_ptr +
+             REAL_BUF_SIZE)) %
+               REAL_BUF_SIZE;
+    int val3 = (((int)
+            (read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR) -
+             dev_info->command_buf.dma_write_ptr +
+             REAL_BUF_SIZE)) %
+               REAL_BUF_SIZE >=
+               num_of_cmds * COMMAND_SIZE);
+    printk(KERN_ERR "Before wait for space %p %p %d %d %d\n",
+           read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR),
+           read_from_dev(dev_info, VINTAGE2D_CMD_WRITE_PTR),
+           val1, val2, val3);
+    wait_event_interruptible(dev_info->wait_queue,
+                             (read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR) ==
+                                     dev_info->command_buf.dma_write_ptr)
+                             ||
+                             (((int) (read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR) -
+                                             dev_info->command_buf.dma_write_ptr +
+                                             REAL_BUF_SIZE)) %
+                                      REAL_BUF_SIZE >=
+                                     num_of_cmds * COMMAND_SIZE));
+     printk(KERN_ERR "Waiting for space %p %p %d %d %d\n",
+           read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR),
+           read_from_dev(dev_info, VINTAGE2D_CMD_WRITE_PTR),
+           val1, val2, val3);
 }
 
 long *get_last_command_addr(command_buf_t *buf)
@@ -231,7 +261,13 @@ void add_cmd_to_buf(pci_dev_info_t *dev_info, long cmd)
         buf->cpu_write_ptr = (long *) buf->buf.cpu_addr;
         buf->dma_write_ptr = buf->buf.dma_addr;
     }
-    send_to_dev(buf->buf.dma_addr, dev_info, VINTAGE2D_CMD_WRITE_PTR);
+    printk(KERN_ERR "Before add, read_ptr: %p, write_ptr: %p\n",
+           read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR),
+           read_from_dev(dev_info, VINTAGE2D_CMD_WRITE_PTR));
+    send_to_dev(buf->dma_write_ptr, dev_info, VINTAGE2D_CMD_WRITE_PTR);
+    printk(KERN_ERR "After add, read_ptr: %p, write_ptr: %p\n",
+           read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR),
+           read_from_dev(dev_info, VINTAGE2D_CMD_WRITE_PTR));
 }
 
 void sync_dev(pci_dev_info_t *dev_info)
@@ -247,8 +283,14 @@ void sync_dev(pci_dev_info_t *dev_info)
     next_flag = current_flag == COUNTER_FLAG_0 ? COUNTER_FLAG_1 : COUNTER_FLAG_0;
     wait_for_space(dev_info, 1);
     add_cmd_to_buf(dev_info, VINTAGE2D_CMD_COUNTER(next_flag, 1));
-    wait_event(dev_info->wait_queue,
+    printk(KERN_ERR "Before sleep, read_ptr: %p, write_ptr: %p\n",
+           read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR),
+           read_from_dev(dev_info, VINTAGE2D_CMD_WRITE_PTR));
+    wait_event_interruptible(dev_info->wait_queue,
                read_from_dev(dev_info, VINTAGE2D_COUNTER) == next_flag);
+    printk(KERN_ERR "After sleep, read_ptr: %p, write_ptr: %p\n",
+           read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR),
+           read_from_dev(dev_info, VINTAGE2D_CMD_WRITE_PTR));
     dev_info->current_context = NULL;
 }
 
@@ -258,7 +300,12 @@ void change_context(pci_dev_info_t *dev_info, dev_context_info_t *context)
     /* Reset TLB */
     send_to_dev(VINTAGE2D_RESET_TLB, dev_info, VINTAGE2D_RESET);
     /* Set page table */
+    printk(KERN_ERR "Before wait for space\n");
     wait_for_space(dev_info, 2);
+    printk(KERN_ERR "After wait for space\n");
+    printk(KERN_ERR "Setting page table, read_ptr: %p, write_ptr: %p\n",
+           read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR),
+           read_from_dev(dev_info, VINTAGE2D_CMD_WRITE_PTR));
     add_cmd_to_buf(dev_info,
                    VINTAGE2D_CMD_CANVAS_PT(
                            context->canvas_page_info.page_table.dma_addr, 0));
@@ -270,8 +317,6 @@ void change_context(pci_dev_info_t *dev_info, dev_context_info_t *context)
 
 int check_pos_cmd(long cmd, long x, long y, dev_context_info_t *dev_context)
 {
-    //printk(KERN_DEBUG "Check pos: x %d, y %d, width %d, height %d\n", x, y,
-    //       dev_context->canvas_width, dev_context->canvas_height);
     if (!REQUIRED_POS_CMD_BITS_ZERO(cmd) ||
             x < 0 ||
             x >= dev_context->canvas_width ||
@@ -350,8 +395,6 @@ int handle_do_blit_cmd(long cmd, pci_dev_info_t *dev_info)
     dst_pos_y = V2D_CMD_POS_Y(dst_pos_cmd);
     width = V2D_CMD_WIDTH(cmd);
     height = V2D_CMD_HEIGHT(cmd);
-    //printk(KERN_DEBUG "Check blit: src_x %d, src_y %d, dst_x %d, dst_y %d, width %d, height %d\n",
-    //       src_pos_x, src_pos_y, dst_pos_x, dst_pos_y, width, height);
     if (src_pos_x + width > dev_info->current_context->canvas_width ||
             dst_pos_x + width > dev_info->current_context->canvas_width ||
             src_pos_y + height > dev_info->current_context->canvas_height ||
@@ -396,7 +439,7 @@ int handle_do_fill_cmd(long cmd, pci_dev_info_t *dev_info)
     clear_his(dev_info->current_context);
     return 0;
 }
-
+// TODO: add __user
 ssize_t vintage_write(struct file *file, const char *buffer,
                       size_t size, loff_t *offset)
 {
@@ -407,10 +450,11 @@ ssize_t vintage_write(struct file *file, const char *buffer,
 
     dev_context = (dev_context_info_t *) file->private_data;
     dev_info = dev_context->pci_dev_info;
-
+    printk(KERN_ERR "Before write, read_ptr: %p, write_ptr: %p\n",
+           read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR),
+           read_from_dev(dev_info, VINTAGE2D_CMD_WRITE_PTR));
     mutex_lock(&dev_info->mutex);
     mutex_lock(&dev_context->mutex);
-
     if (!dev_context->was_ioctl || (size % COMMAND_SIZE) != 0) {
         err = -EINVAL;
         goto write_error;
@@ -427,21 +471,16 @@ ssize_t vintage_write(struct file *file, const char *buffer,
         switch (V2D_CMD_TYPE(current_command)) {
             case VINTAGE2D_CMD_TYPE_SRC_POS:
                 // TODO: Remove all KERN_DEBUG
-                //printk(KERN_DEBUG "src pos\n");
             case V2D_CMD_TYPE_DST_POS:
-                //printk(KERN_DEBUG "dst pos\n");
                 handle_cmd_function = handle_src_or_dst_pos_cmd;
                 break;
             case V2D_CMD_TYPE_FILL_COLOR:
-                //printk(KERN_DEBUG "fill\n");
                 handle_cmd_function = handle_fill_color_cmd;
                 break;
             case V2D_CMD_TYPE_DO_BLIT:
-                //printk(KERN_DEBUG "do blit\n");
                 handle_cmd_function = handle_do_blit_cmd;
                 break;
             case V2D_CMD_TYPE_DO_FILL:
-                //printk(KERN_DEBUG "do fill\n");
                 handle_cmd_function = handle_do_fill_cmd;
                 break;
             default:
@@ -453,9 +492,11 @@ ssize_t vintage_write(struct file *file, const char *buffer,
             goto write_error;
         }
     }
-    //printk(KERN_DEBUG "Success %d\n", i);
     mutex_unlock(&dev_context->mutex);
     mutex_unlock(&dev_info->mutex);
+    printk(KERN_ERR "After write, read_ptr: %p, write_ptr: %p\n",
+           read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR),
+           read_from_dev(dev_info, VINTAGE2D_CMD_WRITE_PTR));
     return size;
 write_error:
     mutex_unlock(&dev_context->mutex);
@@ -661,6 +702,7 @@ int vintage_fsync(struct file *file, loff_t offset1, loff_t offset2,
         return -EINVAL;
     }
     mutex_lock(&dev_context->pci_dev_info->mutex);
+
     if (dev_context->pci_dev_info->current_context == dev_context) {
         sync_dev(dev_context->pci_dev_info);
     }
@@ -677,7 +719,8 @@ irqreturn_t irq_handler(int irq, void *dev)
     interrupt = read_from_dev(dev_info, VINTAGE2D_INTR);
     if (interrupt & VINTAGE2D_INTR_NOTIFY) {
         /* Either there is space in buffer or device finished its job */
-        wake_up(&dev_info->wait_queue);
+        printk(KERN_ERR "Vintage2D interrupt: notify");
+        wake_up_interruptible(&dev_info->wait_queue);
     }
     /* Neither of cases below should happen */
     if (interrupt & VINTAGE2D_INTR_INVALID_CMD) {
@@ -695,6 +738,22 @@ irqreturn_t irq_handler(int irq, void *dev)
     /* Mark all interrupts as handled */
     send_to_dev(interrupt, dev_info, VINTAGE2D_INTR);
     return IRQ_HANDLED;
+}
+
+void init_command_buffer(pci_dev_info_t *pci_dev_info)
+{
+    long *last_command_addr;
+    last_command_addr = get_last_command_addr(&pci_dev_info->command_buf);
+    *last_command_addr = JUMP_TO(pci_dev_info->command_buf.buf.dma_addr);
+    /* Initialize CMD_READ_PTR and CMD_WRITE_PTR */
+    send_to_dev(pci_dev_info->command_buf.buf.dma_addr,
+                pci_dev_info, VINTAGE2D_CMD_READ_PTR);
+    send_to_dev(pci_dev_info->command_buf.buf.dma_addr,
+                pci_dev_info, VINTAGE2D_CMD_WRITE_PTR);
+    pci_dev_info->command_buf.cpu_write_ptr =
+            (long *) pci_dev_info->command_buf.buf.cpu_addr;
+    pci_dev_info->command_buf.dma_write_ptr =
+            pci_dev_info->command_buf.buf.dma_addr;
 }
 
 void reset_device(pci_dev_info_t *dev_info)
@@ -722,22 +781,6 @@ void start_device(pci_dev_info_t *dev_info)
                 dev_info, VINTAGE2D_ENABLE);
 }
 
-void init_command_buffer(pci_dev_info_t *pci_dev_info)
-{
-    long *last_command_addr;
-    last_command_addr = get_last_command_addr(&pci_dev_info->command_buf);
-    *last_command_addr = JUMP_TO(pci_dev_info->command_buf.buf.dma_addr);
-    /* Initialize CMD_READ_PTR and CMD_WRITE_PTR */
-    send_to_dev(pci_dev_info->command_buf.buf.dma_addr,
-                pci_dev_info, VINTAGE2D_CMD_READ_PTR);
-    send_to_dev(pci_dev_info->command_buf.buf.dma_addr,
-                pci_dev_info, VINTAGE2D_CMD_WRITE_PTR);
-    pci_dev_info->command_buf.cpu_write_ptr =
-            (long *) pci_dev_info->command_buf.buf.cpu_addr;
-    pci_dev_info->command_buf.dma_write_ptr =
-            pci_dev_info->command_buf.buf.dma_addr;
-}
-
 static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
 {
     struct cdev *char_dev;
@@ -753,14 +796,13 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
     pci_dev_info = get_first_free_device_info(dev_info_array, MAX_NUM_OF_DEVICES);
     if (pci_dev_info == NULL) {
         printk(KERN_ERR "Failed to add new device\n");
-        // TODO: Which error? (Check everywhere)
         return -ENODEV;
     }
 
     char_dev = cdev_alloc();
     if (IS_ERR_OR_NULL(char_dev)) {
         printk(KERN_ERR "Failed to allocate char device\n");
-        return -ENODEV;
+        return -ENOMEM;
     }
     char_dev->owner = THIS_MODULE;
     char_dev->ops = &vintage_file_ops;
@@ -775,8 +817,6 @@ static int vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
                            NULL, "v2d%d", pci_dev_info->device_number);
     if (IS_ERR_OR_NULL(device)) {
         printk(KERN_ERR "Failed to create device\n");
-        // TODO: Which error?
-
         ret = -ENODEV;
         goto device_create_failed;
     }
@@ -930,8 +970,7 @@ static int vintage_init_module(void)
     vintage_class = class_create(THIS_MODULE, DEVICE_CLASS_NAME);
     if (IS_ERR_OR_NULL(vintage_class)) {
         printk(KERN_ERR "Failed to create device class\n");
-        // TODO: Which error?
-        ret = -ENODEV;
+        ret = -EAGAIN;
         goto class_create_failed;
     }
 
@@ -951,7 +990,6 @@ static int vintage_init_module(void)
 pci_register_driver_failed:
     class_destroy(vintage_class);
 class_create_failed:
-    // TODO: unregister_chrdev_region(dev_number, 1) ?
     unregister_chrdev_region(dev_number, MAX_NUM_OF_DEVICES);
     return ret;
 }
