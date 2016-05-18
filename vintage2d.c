@@ -285,39 +285,14 @@ wait_for_space(pci_dev_info_t *dev_info, unsigned int num_of_cmds)
 {
     /* Wait until there is enough space in circular buffer */
     int cmd_read_ptr;
-//    printk(KERN_ERR "wait for space\n");
-//    int val1 = ((int)
-//            (read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR) -
-//             dev_info->command_buf.dma_write_ptr +
-//             REAL_BUF_SIZE));
-//    int val2 = ((int)
-//            (read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR) -
-//             dev_info->command_buf.dma_write_ptr +
-//             REAL_BUF_SIZE)) %
-//               REAL_BUF_SIZE;
-//    int val3 = (((int)
-//            (read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR) -
-//             dev_info->command_buf.dma_write_ptr +
-//             REAL_BUF_SIZE)) %
-//               REAL_BUF_SIZE >=
-//               num_of_cmds * COMMAND_SIZE);
-
-//    printk(KERN_ERR "Before wait for space %p %p %d %d %d\n",
-//           read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR),
-//           read_from_dev(dev_info, VINTAGE2D_CMD_WRITE_PTR),
-//           val1, val2, val3);
-    wait_event_interruptible(dev_info->wait_queue,
-                             ((cmd_read_ptr = read_from_dev(dev_info,
-                                                            VINTAGE2D_CMD_READ_PTR)) ==
-                              dev_info->command_buf.dma_write_ptr)
-                             ||
-                             (((int) (cmd_read_ptr - dev_info->command_buf.dma_write_ptr
-                                      + REAL_BUF_SIZE - 1)) % REAL_BUF_SIZE >=
-                              num_of_cmds * COMMAND_SIZE));
-//     printk(KERN_ERR "Waiting for space %p %p %d %d %d\n",
-//           read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR),
-//           read_from_dev(dev_info, VINTAGE2D_CMD_WRITE_PTR),
-//           val1, val2, val3);
+    wait_event(dev_info->wait_queue,
+               ((cmd_read_ptr = read_from_dev(dev_info,
+                                            VINTAGE2D_CMD_READ_PTR)) ==
+                dev_info->command_buf.dma_write_ptr)
+               ||
+               (((int) (cmd_read_ptr - dev_info->command_buf.dma_write_ptr
+                        + REAL_BUF_SIZE - 1)) % REAL_BUF_SIZE >=
+                num_of_cmds * COMMAND_SIZE));
 }
 
 void
@@ -331,13 +306,7 @@ add_cmd_to_buf(pci_dev_info_t *dev_info, long cmd)
         buf->cpu_write_ptr = (long *) buf->buf.cpu_addr;
         buf->dma_write_ptr = buf->buf.dma_addr;
     }
-//    printk(KERN_ERR "Before add, read_ptr: %p, write_ptr: %p\n",
-//           read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR),
-//           read_from_dev(dev_info, VINTAGE2D_CMD_WRITE_PTR));
     send_to_dev(buf->dma_write_ptr, dev_info, VINTAGE2D_CMD_WRITE_PTR);
-//    printk(KERN_ERR "After add, read_ptr: %p, write_ptr: %p\n",
-//           read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR),
-//           read_from_dev(dev_info, VINTAGE2D_CMD_WRITE_PTR));
 }
 
 // File operations utils
@@ -356,14 +325,8 @@ sync_dev(pci_dev_info_t *dev_info)
     next_flag = current_flag == COUNTER_FLAG_0 ? COUNTER_FLAG_1 : COUNTER_FLAG_0;
     wait_for_space(dev_info, 1);
     add_cmd_to_buf(dev_info, VINTAGE2D_CMD_COUNTER(next_flag, 1));
-//    printk(KERN_ERR "Before sleep, read_ptr: %p, write_ptr: %p\n",
-//           read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR),
-//           read_from_dev(dev_info, VINTAGE2D_CMD_WRITE_PTR));
-    wait_event_interruptible(dev_info->wait_queue,
-                             read_from_dev(dev_info, VINTAGE2D_COUNTER) == next_flag);
-//    printk(KERN_ERR "After sleep, read_ptr: %p, write_ptr: %p\n",
-//           read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR),
-//           read_from_dev(dev_info, VINTAGE2D_CMD_WRITE_PTR));
+    wait_event(dev_info->wait_queue,
+               read_from_dev(dev_info, VINTAGE2D_COUNTER) == next_flag);
     dev_info->current_context = NULL;
 }
 
@@ -374,12 +337,7 @@ change_context(pci_dev_info_t *dev_info, dev_context_info_t *context)
     /* Reset TLB */
     send_to_dev(VINTAGE2D_RESET_TLB, dev_info, VINTAGE2D_RESET);
     /* Set page table */
-    //printk(KERN_ERR "Before wait for space\n");
     wait_for_space(dev_info, 2);
-//    printk(KERN_ERR "After wait for space\n");
-//    printk(KERN_ERR "Setting page table, read_ptr: %p, write_ptr: %p\n",
-//           read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR),
-//           read_from_dev(dev_info, VINTAGE2D_CMD_WRITE_PTR));
     add_cmd_to_buf(dev_info,
                    VINTAGE2D_CMD_CANVAS_PT(
                            context->canvas_page_info.page_table.dma_addr, 0));
@@ -550,7 +508,6 @@ vintage_write(struct file *file, const char *buffer, size_t size, loff_t *offset
         }
         switch (V2D_CMD_TYPE(current_command)) {
             case VINTAGE2D_CMD_TYPE_SRC_POS:
-                // TODO: Remove all KERN_DEBUG
             case V2D_CMD_TYPE_DST_POS:
                 handle_cmd_function = handle_src_or_dst_pos_cmd;
                 break;
@@ -608,8 +565,6 @@ alloc_memory_for_canvas(uint16_t canvas_width, uint16_t canvas_height,
     vintage_mem_t *current_page;
     canvas_page_info_t *canvas_page_info;
     struct device *device;
-
-//    printk(KERN_WARNING "Height: %d, width: %d\n", canvas_height, canvas_width);
 
     canvas_size = canvas_width * canvas_height;
     device = &dev_context->pci_dev_info->pci_dev->dev;
@@ -735,7 +690,7 @@ vintage_open(struct inode *inode, struct file *file)
     minor = iminor(inode);
     dev_info = get_dev_info_by_minor(dev_info_array, MAX_NUM_OF_DEVICES, minor);
     if (dev_info == NULL) {
-        printk(KERN_WARNING "Device with minor number %d not found\n", minor);
+        printk(KERN_ERR "Device with minor number %d not found\n", minor);
         return -ENODEV;
     }
     dev_context = kzalloc(sizeof(dev_context_info_t), GFP_KERNEL);
@@ -800,7 +755,7 @@ irq_handler(int irq, void *dev)
     interrupt = read_from_dev(dev_info, VINTAGE2D_INTR);
     if (interrupt & VINTAGE2D_INTR_NOTIFY) {
         /* Either there is space in buffer or device finished its job */
-        wake_up_interruptible(&dev_info->wait_queue);
+        wake_up(&dev_info->wait_queue);
     }
     /* Neither of cases below should happen */
     if (interrupt & VINTAGE2D_INTR_INVALID_CMD) {
