@@ -655,8 +655,7 @@ vintage_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
 {
     struct v2d_ioctl_set_dimensions dimensions;
     dev_context_info_t *dev_context;
-
-//    printk(KERN_WARNING "IOCTL\n");
+    long err;
 
     if (cmd != V2D_IOCTL_SET_DIMENSIONS) {
         return -ENOTTY;
@@ -667,31 +666,34 @@ vintage_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     mutex_lock(&dev_context->mutex);
 
     if (dev_context->was_ioctl) {
-        mutex_unlock(&dev_context->mutex);
-        return -EINVAL;
+        err = -EINVAL;
+        goto ioctl_error;
     }
     if (copy_from_user((void *) &dimensions, (void *) arg,
             sizeof(struct v2d_ioctl_set_dimensions)) != 0) {
-        mutex_unlock(&dev_context->mutex);
         printk(KERN_ERR "Copying from user space failed\n");
-        return -EFAULT;
+        err = -EFAULT;
+        goto ioctl_error;
     }
     if (dimensions.width < MIN_WIDTH ||
             dimensions.width > MAX_WIDTH ||
             dimensions.height < MIN_HEIGHT ||
             dimensions.height > MAX_HEIGHT) {
-        mutex_unlock(&dev_context->mutex);
-        return -EINVAL;
+        err = -EINVAL;
+        goto ioctl_error;
     }
     if (alloc_memory_for_canvas(dimensions.width, dimensions.height,
                                 dev_context) < 0) {
-        mutex_unlock(&dev_context->mutex);
-        return -ENOMEM;
+        err = -ENOMEM;
+        goto ioctl_error;
     }
     /* ioctl successful */
     dev_context->was_ioctl = 1;
     mutex_unlock(&dev_context->mutex);
     return 0;
+ioctl_error:
+    mutex_unlock(&dev_context->mutex);
+    return err;
 }
 
 int
@@ -772,7 +774,7 @@ vintage_fsync(struct file *file, loff_t offset1, loff_t offset2, int datasync)
     if (!dev_context->was_ioctl) {
         return -EINVAL;
     }
-    
+
     mutex_lock(&dev_context->pci_dev_info->mutex);
     if (dev_context->pci_dev_info->current_context == dev_context) {
         sync_dev(dev_context->pci_dev_info);
@@ -790,24 +792,28 @@ irq_handler(int irq, void *dev)
     pci_dev_info_t *dev_info;
 
     dev_info = (pci_dev_info_t *) dev;
+    if (dev_info->pci_dev->irq != irq) {
+        printk(KERN_ERR "Vintage2D detected unexpected interrupt\n");
+        return IRQ_HANDLED;
+    }
+
     interrupt = read_from_dev(dev_info, VINTAGE2D_INTR);
     if (interrupt & VINTAGE2D_INTR_NOTIFY) {
         /* Either there is space in buffer or device finished its job */
-        //printk(KERN_ERR "Vintage2D interrupt: notify");
         wake_up_interruptible(&dev_info->wait_queue);
     }
     /* Neither of cases below should happen */
     if (interrupt & VINTAGE2D_INTR_INVALID_CMD) {
-        printk(KERN_ERR "Vintage2D interrupt: invalid command");
+        printk(KERN_ERR "Vintage2D interrupt: invalid command\n");
     }
     if (interrupt & VINTAGE2D_INTR_PAGE_FAULT) {
-        printk(KERN_ERR "Vintage2D interrupt: page fault");
+        printk(KERN_ERR "Vintage2D interrupt: page fault\n");
     }
     if (interrupt & VINTAGE2D_INTR_CANVAS_OVERFLOW) {
-        printk(KERN_ERR "Vintage2D interrupt: canvas overflow");
+        printk(KERN_ERR "Vintage2D interrupt: canvas overflow\n");
     }
     if (interrupt & VINTAGE2D_INTR_FIFO_OVERFLOW) {
-        printk(KERN_ERR "Vintage2D interrupt: FIFO overflow");
+        printk(KERN_ERR "Vintage2D interrupt: FIFO overflow\n");
     }
     /* Mark all interrupts as handled */
     send_to_dev(interrupt, dev_info, VINTAGE2D_INTR);
