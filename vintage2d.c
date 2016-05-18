@@ -424,7 +424,7 @@ handle_do_blit_cmd(long cmd, pci_dev_info_t *dev_info)
     dst_pos_cmd = get_cmd_from_his(&dev_info->current_context->command_his,
                                    VINTAGE2D_CMD_TYPE_DST_POS);
     if (src_pos_cmd == -1 || dst_pos_cmd == -1) {
-        printk(KERN_WARNING "DO_BLIT should be preceded by SRC_POS and DST_POS\n");
+        printk(KERN_WARNING "Vintage2D: DO_BLIT should be preceded by SRC_POS and DST_POS\n");
         return -1;
     }
     src_pos_x = V2D_CMD_POS_X(src_pos_cmd);
@@ -459,7 +459,7 @@ handle_do_fill_cmd(long cmd, pci_dev_info_t *dev_info)
     fill_color_cmd = get_cmd_from_his(&dev_info->current_context->command_his,
                                       VINTAGE2D_CMD_TYPE_FILL_COLOR);
     if (dst_pos_cmd == -1 || fill_color_cmd == -1) {
-        printk(KERN_WARNING "DO_FILL should be preceded by DST_POS and FILL_COLOR\n");
+        printk(KERN_WARNING "Vintage2D: DO_FILL should be preceded by DST_POS and FILL_COLOR\n");
         return -1;
     }
     dst_pos_x = V2D_CMD_POS_X(dst_pos_cmd);
@@ -574,7 +574,7 @@ alloc_memory_for_canvas(uint16_t canvas_width, uint16_t canvas_height,
                                                &page_table->dma_addr,
                                                GFP_KERNEL);
     if (IS_ERR_OR_NULL(page_table->cpu_addr)) {
-        printk(KERN_ERR "Failed to allocate memory for device's page table\n");
+        printk(KERN_ERR "Vintage2D: failed to allocate memory for device's page table\n");
         return -1;
     }
     num_of_pages_to_alloc = DIV_ROUND_UP(canvas_size, VINTAGE2D_PAGE_SIZE);
@@ -588,7 +588,7 @@ alloc_memory_for_canvas(uint16_t canvas_width, uint16_t canvas_height,
                                                      &current_page->dma_addr,
                                                      GFP_KERNEL);
         if (IS_ERR_OR_NULL(current_page->cpu_addr)) {
-            printk(KERN_ERR "Failed to allocate memory for device's page\n");
+            printk(KERN_ERR "Vintage2D: failed to allocate memory for device's page\n");
             cleanup_canvas_pages(device, canvas_page_info, i);
             return -1;
         }
@@ -626,7 +626,7 @@ vintage_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
     }
     if (copy_from_user((void *) &dimensions, (void *) arg,
             sizeof(struct v2d_ioctl_set_dimensions)) != 0) {
-        printk(KERN_ERR "Copying from user space failed\n");
+        printk(KERN_ERR "Vintage2D: copying from user space failed\n");
         err = -EFAULT;
         goto ioctl_error;
     }
@@ -690,12 +690,12 @@ vintage_open(struct inode *inode, struct file *file)
     minor = iminor(inode);
     dev_info = get_dev_info_by_minor(dev_info_array, MAX_NUM_OF_DEVICES, minor);
     if (dev_info == NULL) {
-        printk(KERN_ERR "Device with minor number %d not found\n", minor);
+        printk(KERN_ERR "Vintage2D: device with minor number %d not found\n", minor);
         return -ENODEV;
     }
     dev_context = kzalloc(sizeof(dev_context_info_t), GFP_KERNEL);
     if (IS_ERR_OR_NULL(dev_context)) {
-        printk(KERN_ERR "Failed to allocate memory\n");
+        printk(KERN_ERR "Vintage2D: failed to allocate memory\n");
         return -ENOMEM;
     }
     dev_context->pci_dev_info = dev_info;
@@ -786,17 +786,15 @@ vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
     dma_addr_t dma_addr;
     int ret;
 
-    printk(KERN_WARNING "Vintage probe\n");
-
     pci_dev_info = get_first_free_device_info(dev_info_array, MAX_NUM_OF_DEVICES);
     if (pci_dev_info == NULL) {
-        printk(KERN_ERR "Failed to add new device\n");
+        printk(KERN_ERR "Vintage2D: failed to add new device\n");
         return -ENODEV;
     }
 
     char_dev = cdev_alloc();
     if (IS_ERR_OR_NULL(char_dev)) {
-        printk(KERN_ERR "Failed to allocate char device\n");
+        printk(KERN_ERR "Vintage2D: failed to allocate char device\n");
         return -ENOMEM;
     }
     char_dev->owner = THIS_MODULE;
@@ -804,32 +802,32 @@ vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
     ret = cdev_add(char_dev, pci_dev_info->dev_number, 1);
     if (ret < 0) {
         // TODO: Free char_dev?
-        printk(KERN_ERR "Failed to add char device\n");
+        printk(KERN_ERR "Vintage2D: failed to add char device\n");
         return ret;
     }
     // TODO: call device_create before cdev_add?
     device = device_create(vintage_class, NULL, pci_dev_info->dev_number,
                            NULL, "v2d%d", pci_dev_info->device_number);
     if (IS_ERR_OR_NULL(device)) {
-        printk(KERN_ERR "Failed to create device\n");
+        printk(KERN_ERR "Vintage2D: failed to create device\n");
         ret = -ENODEV;
         goto device_create_failed;
     }
 
     if (!(pci_resource_flags(dev, 0) & IORESOURCE_MEM)) {
-        printk(KERN_ERR "BAR0 is not an IO region\n");
+        printk(KERN_ERR "Vintage2D: BAR0 is not an IO region\n");
         goto pci_request_regions_failed;
     }
 
     ret = pci_request_regions(dev, DRIVER_NAME);
     if (ret < 0) {
-        printk(KERN_ERR "Failed to request BAR0\n");
+        printk(KERN_ERR "Vintage2D: failed to request BAR0\n");
         goto pci_request_regions_failed;
     }
 
     iomem = pci_iomap(dev, 0, MMIO_SIZE);
     if (IS_ERR_OR_NULL(iomem)) {
-        printk(KERN_ERR "Failed to map BAR0\n");
+        printk(KERN_ERR "Vintage2D: failed to map BAR0\n");
         if (iomem == NULL) {
             ret = -ENOMEM;
         } else {
@@ -841,7 +839,7 @@ vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
     ret = request_irq(dev->irq, irq_handler, IRQF_SHARED, DRIVER_NAME,
                       (void *) pci_dev_info);
     if (ret < 0) {
-        printk(KERN_ERR "Failed to request irq\n");
+        printk(KERN_ERR "Vintage2D: failed to request irq\n");
         goto request_irq_failed;
     }
 
@@ -849,12 +847,12 @@ vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
 
     ret = pci_set_dma_mask(dev, DMA_BIT_MASK(32));
     if (ret < 0) {
-        printk(KERN_ERR "Failed to set DMA mask\n");
+        printk(KERN_ERR "Vintage2D: failed to set DMA mask\n");
         goto setup_dma_failed;
     }
     ret = pci_set_consistent_dma_mask(dev, DMA_BIT_MASK(32));
     if (ret < 0) {
-        printk(KERN_ERR "Failed to set consistent DMA mask\n");
+        printk(KERN_ERR "Vintage2D: failed to set consistent DMA mask\n");
         goto setup_dma_failed;
     }
 
@@ -862,14 +860,14 @@ vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
     cpu_addr = dma_zalloc_coherent(&dev->dev, COMMAND_BUF_SIZE, &dma_addr,
                                    GFP_KERNEL);
     if (IS_ERR_OR_NULL(cpu_addr)) {
-        printk(KERN_ERR "Failed to allocate memory for device's command buffer\n");
+        printk(KERN_ERR "Vintage2D: failed to allocate memory for device's command buffer\n");
         ret = -ENOMEM;
         goto setup_dma_failed;
     }
 
     ret = pci_enable_device(dev);
     if (ret < 0) {
-        printk(KERN_ERR "Failed to enable device\n");
+        printk(KERN_ERR "Vintage2D: failed to enable device\n");
         goto enable_device_failed;
     }
 
@@ -904,7 +902,6 @@ void
 remove_device(pci_dev_info_t *pci_dev_info)
 {
     if (pci_dev_info->pci_dev != NULL) {
-        printk(KERN_DEBUG "Removing device\n");
         /* Disable interrupts, draw and fetching commands */
         stop_device(pci_dev_info);
         if (pci_is_enabled(pci_dev_info->pci_dev)) {
@@ -930,11 +927,9 @@ static void
 vintage_remove(struct pci_dev *dev)
 {
     pci_dev_info_t *pci_dev_info;
-    printk(KERN_WARNING "Vintage remove\n");
-
     pci_dev_info = get_dev_info(dev_info_array, MAX_NUM_OF_DEVICES, dev);
     if (pci_dev_info == NULL) {
-        printk(KERN_WARNING "Vintage remove: device not found in device table - "
+        printk(KERN_WARNING "Vintage2D remove: device not found in device table - "
                        "probably is already removed\n");
         if (pci_is_enabled(dev)) {
             pci_disable_device(dev);
@@ -949,18 +944,16 @@ vintage_init_module(void)
 {
     int ret;
 
-    printk(KERN_ERR "Module init\n");
-
     /* allocate major numbers */
     ret = alloc_chrdev_region(&dev_number, 0, MAX_NUM_OF_DEVICES, DRIVER_NAME);
     if (ret < 0) {
-        printk(KERN_ERR "Failed to allocate major number\n");
+        printk(KERN_ERR "Vintage2D: failed to allocate major number\n");
         return ret;
     }
 
     vintage_class = class_create(THIS_MODULE, DEVICE_CLASS_NAME);
     if (IS_ERR_OR_NULL(vintage_class)) {
-        printk(KERN_ERR "Failed to create device class\n");
+        printk(KERN_ERR "Vintage2D: failed to create device class\n");
         ret = -EAGAIN;
         goto class_create_failed;
     }
@@ -972,7 +965,7 @@ vintage_init_module(void)
     /* register pci driver */
     ret = pci_register_driver(&vintage_driver);
     if (ret < 0) {
-        printk(KERN_ERR "Failed to register Vintage2D driver\n");
+        printk(KERN_ERR "Vintage2D: failed to register driver\n");
         goto pci_register_driver_failed;
     }
 
@@ -989,8 +982,6 @@ static void
 vintage_exit_module(void)
 {
     int i;
-    printk(KERN_WARNING "Module exit\n");
-
     /* unregister pci driver */
     pci_unregister_driver(&vintage_driver);
 
@@ -1004,8 +995,6 @@ vintage_exit_module(void)
 
     /* free major / minor number */
     unregister_chrdev_region(dev_number, MAX_NUM_OF_DEVICES);
-
-    printk(KERN_DEBUG "Module exit end\n");
 }
 
 module_init(vintage_init_module);
