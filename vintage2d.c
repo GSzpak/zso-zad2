@@ -478,9 +478,10 @@ handle_do_fill_cmd(long cmd, pci_dev_info_t *dev_info)
     clear_his(&dev_info->current_context->command_his);
     return 0;
 }
-// TODO: add __user
+
 ssize_t
-vintage_write(struct file *file, const char *buffer, size_t size, loff_t *offset)
+vintage_write(struct file *file, const char __user *buffer, size_t size,
+              loff_t *offset)
 {
     long current_command, i, err;
     dev_context_info_t *dev_context;
@@ -805,7 +806,6 @@ vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
         printk(KERN_ERR "Vintage2D: failed to add char device\n");
         return ret;
     }
-    // TODO: call device_create before cdev_add?
     device = device_create(vintage_class, NULL, pci_dev_info->dev_number,
                            NULL, "v2d%d", pci_dev_info->device_number);
     if (IS_ERR_OR_NULL(device)) {
