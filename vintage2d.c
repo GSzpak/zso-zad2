@@ -201,7 +201,7 @@ reset_dev_info(pci_dev_info_t *pci_dev_info)
 }
 
 /* Utils for array of devices */
-// TODO: Synchronization in probe / remove?
+
 void
 init_pci_dev_info(pci_dev_info_t dev_info_arr[], unsigned int size,
                   unsigned int major, unsigned int first_minor)
@@ -286,8 +286,7 @@ wait_for_space(pci_dev_info_t *dev_info, unsigned int num_of_cmds)
     /* Wait until there is enough space in circular buffer */
     int cmd_read_ptr;
     wait_event(dev_info->wait_queue,
-               ((cmd_read_ptr = read_from_dev(dev_info,
-                                            VINTAGE2D_CMD_READ_PTR)) ==
+               ((cmd_read_ptr = read_from_dev(dev_info, VINTAGE2D_CMD_READ_PTR)) ==
                 dev_info->command_buf.dma_write_ptr)
                ||
                (((int) (cmd_read_ptr - dev_info->command_buf.dma_write_ptr
@@ -876,6 +875,7 @@ vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
     }
 
     /* Device successfully added */
+    mutex_lock(&pci_dev_info->mutex);
     pci_dev_info->pci_dev = dev;
     pci_dev_info->char_dev = char_dev;
     pci_dev_info->iomem = iomem;
@@ -883,6 +883,7 @@ vintage_probe(struct pci_dev *dev, const struct pci_device_id *id)
     pci_dev_info->command_buf.buf.dma_addr = dma_addr;
     init_command_buffer(pci_dev_info);
     start_device(pci_dev_info);
+    mutex_unlock(&pci_dev_info->mutex);
 
     return 0;
 
@@ -905,6 +906,7 @@ device_create_failed:
 void
 remove_device(pci_dev_info_t *pci_dev_info)
 {
+    mutex_lock(&pci_dev_info->mutex);
     if (pci_dev_info->pci_dev != NULL) {
         /* Disable interrupts, draw and fetching commands */
         stop_device(pci_dev_info);
@@ -925,6 +927,7 @@ remove_device(pci_dev_info_t *pci_dev_info)
         cdev_del(pci_dev_info->char_dev);
     }
     reset_dev_info(pci_dev_info);
+    mutex_unlock(&pci_dev_info->mutex);
 }
 
 static void
